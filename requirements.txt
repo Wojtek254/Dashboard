@@ -1,3 +1,5 @@
 streamlit>=1.30
 geemap>=0.27.0
 earthengine-api>=0.1.381
+setuptools
+pkg_resources
