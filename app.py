@@ -1,9 +1,4 @@
 # === Streamlit Dashboard: Opady CHIRPS z Earth Engine (Włochy 2023) ===
-import streamlit as st
-import geemap.foliumap as geemap
-import ee
-import datetime
-
 import json
 import streamlit as st
 import ee
