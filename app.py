@@ -4,19 +4,18 @@ import geemap.foliumap as geemap
 import ee
 import datetime
 
+import json
+import streamlit as st
+import ee
+
 try:
-    ee.Initialize()
+    credentials = json.loads(st.secrets["EARTHENGINE_TOKEN"])
+    ee.Initialize(ee.Credentials(**credentials))
 except Exception as e:
-    import streamlit as st
-    st.warning("🔑 Potrzebna autoryzacja Google Earth Engine.")
-    with st.expander("Kliknij tutaj, aby się zalogować"):
-        try:
-            ee.Authenticate()
-            ee.Initialize()
-            st.success("✅ Autoryzacja zakończona sukcesem!")
-        except Exception as auth_error:
-            st.error("❌ Błąd autoryzacji: " + str(auth_error))
-            st.stop()
+    st.error("❌ Nie udało się połączyć z Google Earth Engine.")
+    st.exception(e)
+    st.stop()
+
 
 st.set_page_config(layout="wide")
 st.title("📊 Dashboard opadów dziennych (CHIRPS, Włochy 2023)")
