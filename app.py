@@ -1,15 +1,20 @@
 # === Streamlit Dashboard: Opady CHIRPS z Earth Engine (Włochy 2023) ===
 import json
-import streamlit as st
 import ee
+import streamlit as st
 
 try:
-    credentials = json.loads(st.secrets["EARTHENGINE_TOKEN"])
-    ee.Initialize(ee.OAuth2Credentials(**credentials))
+    creds_dict = json.loads(st.secrets["EARTHENGINE_TOKEN"])
+    creds_dict["type"] = "authorized_user"  # jawnie ustawiamy typ
+
+    from google.oauth2.credentials import Credentials
+    credentials = Credentials.from_authorized_user_info(info=creds_dict)
+    ee.Initialize(credentials)
 except Exception as e:
     st.error("❌ Nie udało się połączyć z Google Earth Engine.")
     st.exception(e)
     st.stop()
+
 
 
 
