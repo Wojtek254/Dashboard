@@ -2,12 +2,10 @@
 import json
 import ee
 import streamlit as st
+from google.oauth2.credentials import Credentials
 
 try:
     creds_dict = json.loads(st.secrets["EARTHENGINE_TOKEN"])
-    creds_dict["type"] = "authorized_user"  # jawnie ustawiamy typ
-
-    from google.oauth2.credentials import Credentials
     credentials = Credentials.from_authorized_user_info(info=creds_dict)
     ee.Initialize(credentials)
 except Exception as e:
