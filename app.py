@@ -5,11 +5,12 @@ import ee
 
 try:
     credentials = json.loads(st.secrets["EARTHENGINE_TOKEN"])
-    ee.Initialize(ee.Credentials(**credentials))
+    ee.Initialize(ee.OAuth2Credentials(**credentials))
 except Exception as e:
     st.error("❌ Nie udało się połączyć z Google Earth Engine.")
     st.exception(e)
     st.stop()
+
 
 
 st.set_page_config(layout="wide")
