@@ -15,7 +15,7 @@ from google.oauth2 import service_account
 # CONFIG
 # ---------------------------------------------
 PROJECT_ID = "dashboard-streamlit-1"
-ASSET_FOLDER = "projects/{PROJECT_ID}/assets/CYGNSS"
+ASSET_FOLDER = "projects/{PROJECT_ID}/assets"
 
 # Julian days (2021_182 ... 2021_212)
 START_DOY = 182
