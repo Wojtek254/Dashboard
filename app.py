@@ -15,7 +15,7 @@ from google.oauth2 import service_account
 # CONFIG
 # ---------------------------------------------
 PROJECT_ID = "dahsboard-streamlit-1"
-ASSET_FOLDER = "projects/{PROJECT_ID}/assets"
+ASSET_FOLDER = "projects/dahsboard-streamlit-1/assets"
 
 # Julian days (2021_182 ... 2021_212)
 START_DOY = 182
