@@ -74,12 +74,15 @@ DATA_MODES = {
 # INITIALIZE GEE
 # ---------------------------------------------
 def ensure_ee():
-    if not ee.data._initialized:
+    try:
         credentials = service_account.Credentials.from_service_account_info(
             dict(st.secrets["gcp_service_account"]),
             scopes=["https://www.googleapis.com/auth/earthengine"],
         )
         ee.Initialize(credentials=credentials, project=PROJECT_ID)
+    except Exception as e:
+        st.error(f"Earth Engine initialization failed: {e}")
+        st.stop()
 ensure_ee()
 
 # ---------------------------------------------
