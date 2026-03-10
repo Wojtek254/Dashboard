@@ -9,6 +9,7 @@ from streamlit_folium import st_folium
 import datetime as dt
 import pandas as pd
 import altair as alt
+from google.oauth2 import service_account
 
 # ---------------------------------------------
 # CONFIG
@@ -73,13 +74,12 @@ DATA_MODES = {
 # INITIALIZE GEE
 # ---------------------------------------------
 def ensure_ee():
-    try:
-        ee.Initialize(project=PROJECT_ID)
-    except Exception:
-        ee.Authenticate(auth_mode="localhost", project=PROJECT_ID)
-        ee.Initialize(project=PROJECT_ID)
-
-ensure_ee()
+    if not ee.data._initialized:
+        credentials = service_account.Credentials.from_service_account_info(
+            dict(st.secrets["gcp_service_account"]),
+            scopes=["https://www.googleapis.com/auth/earthengine"],
+        )
+        ee.Initialize(credentials=credentials, project=PROJECT_ID)
 
 # ---------------------------------------------
 # IMAGE COLLECTIONS
