@@ -80,6 +80,7 @@ def ensure_ee():
             scopes=["https://www.googleapis.com/auth/earthengine"],
         )
         ee.Initialize(credentials=credentials, project=PROJECT_ID)
+ensure_ee()
 
 # ---------------------------------------------
 # IMAGE COLLECTIONS
