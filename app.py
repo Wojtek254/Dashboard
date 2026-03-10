@@ -13,7 +13,7 @@ import altair as alt
 # ---------------------------------------------
 # CONFIG
 # ---------------------------------------------
-PROJECT_ID = "cygnss-dashboard"
+PROJECT_ID = "dahsboard-streamlit-1"
 ASSET_FOLDER = f"projects/{PROJECT_ID}/assets/CYGNSS"
 
 # Julian days (2021_182 ... 2021_212)
