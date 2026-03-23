@@ -481,7 +481,16 @@ def extract_feature_from_map_state(map_state):
                 feature = drawings[-1]
     return feature
 
-def build_map(image, thr_min, thr_max, kind, mode_label, saved_feature=None):
+def build_map(
+    image,
+    thr_min,
+    thr_max,
+    kind,
+    mode_label,
+    saved_feature=None,
+    map_center=None,
+    map_zoom=None,
+):
     """
     Build the Folium map used in the dashboard.
 
@@ -500,7 +509,12 @@ def build_map(image, thr_min, thr_max, kind, mode_label, saved_feature=None):
         "palette": palette,
     }
 
-    m = folium.Map(location=CENTER, zoom_start=ZOOM, tiles="Esri.WorldImagery")
+    if map_center is None:
+        map_center = CENTER
+    if map_zoom is None:
+        map_zoom = ZOOM
+
+    m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
 
     map_id = band.getMapId(vis)
     tile_url = map_id["tile_fetcher"].url_format
@@ -741,6 +755,12 @@ st.caption(
 # ---------------------------------------------
 if "saved_feature" not in st.session_state:
     st.session_state.saved_feature = None
+
+if "map_center" not in st.session_state:
+    st.session_state.map_center = CENTER
+
+if "map_zoom" not in st.session_state:
+    st.session_state.map_zoom = ZOOM
 
 # Optional button to clear the saved region
 if st.button("Clear selected region"):
