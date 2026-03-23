@@ -385,63 +385,53 @@ def compute_region_pixel_count(
     kind,
     band_index,
 ):
-    """
-    Zwraca dwie wartości:
-      - in_range_count: liczba pikseli w zakresie progów (mean image)
-      - total_count:    liczba wszystkich ważnych pikseli (≠255) w prostokącie
-
-    in_range_count liczymy na średnim obrazie po thresholdzie,
-    total_count liczymy na pierwszym obrazie z kolekcji (piksele !=255).
-    """
     selected_days = list(selected_days_tuple)
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
 
     ic = get_collection(kind)
     ic_sel = ic.filter(ee.Filter.inList("day", selected_days))
 
-    # --- obraz do liczenia pikseli w zakresie (mean po thresholdzie) ---
     if kind == "inundation":
-        ic_inrange = ic_sel.map(
-            lambda img: mask_inund_band(img, band_index, thr_min, thr_max)
-        )
-    else:  # anomaly
-        ic_inrange = ic_sel.map(
-            lambda img: anomaly_band3_thresholded(img, thr_min, thr_max)
-        )
+        def valid_mask(img):
+            band = img.select(band_index)
+            return band.lt(255).selfMask().unmask(0)
 
-    stacked = ic_inrange.toBands()
-    pixel_mean = stacked.reduce(ee.Reducer.mean())
+        def inrange_mask(img):
+            band = img.select(band_index)
+            mask = band.gte(thr_min).And(band.lte(thr_max)).And(band.lt(255))
+            return mask.selfMask().unmask(0)
 
-    d_in = pixel_mean.reduceRegion(
-        reducer=ee.Reducer.count(),
+    else:
+        def valid_mask(img):
+            raw = img.select(0)
+            mask = raw.neq(255)
+            return mask.selfMask().unmask(0)
+
+        def inrange_mask(img):
+            raw = img.select(0)
+            corr = raw.subtract(100)
+            mask = raw.neq(255).And(corr.gte(thr_min)).And(corr.lte(thr_max))
+            return mask.selfMask().unmask(0)
+
+    valid_any = ic_sel.map(valid_mask).max()
+    inrange_any = ic_sel.map(inrange_mask).max()
+
+    d_tot = valid_any.reduceRegion(
+        reducer=ee.Reducer.sum(),
         geometry=region,
         scale=3000,
         maxPixels=1e13,
     ).getInfo()
-    if not d_in:
-        in_range_count = 0
-    else:
-        val_in = list(d_in.values())[0]
-        in_range_count = int(val_in) if val_in is not None else 0
 
-    # --- obraz do liczenia wszystkich ważnych pikseli (≠255) ---
-    first_img = ic_sel.first()
-    if kind == "inundation":
-        valid_img = inund_valid_band(first_img, band_index)
-    else:
-        valid_img = anomaly_band3_corrected(first_img)
-
-    d_tot = valid_img.reduceRegion(
-        reducer=ee.Reducer.count(),
+    d_in = inrange_any.reduceRegion(
+        reducer=ee.Reducer.sum(),
         geometry=region,
         scale=3000,
         maxPixels=1e13,
     ).getInfo()
-    if not d_tot:
-        total_count = 0
-    else:
-        val_tot = list(d_tot.values())[0]
-        total_count = int(val_tot) if val_tot is not None else 0
+
+    total_count = int(list(d_tot.values())[0]) if d_tot and list(d_tot.values())[0] is not None else 0
+    in_range_count = int(list(d_in.values())[0]) if d_in and list(d_in.values())[0] is not None else 0
 
     return in_range_count, total_count
 
