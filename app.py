@@ -584,7 +584,7 @@ def build_map(
 
     legend_html = f"""
      <div style='position: fixed; bottom: 40px; left: 40px; width: {width}px;
-         background-color: white; padding: 10px; border:2px solid grey; z-index:9999;'>
+         background-color: white; color: black; padding: 10px; border:2px solid grey; z-index:9999;'>
      <b>{mode_label} ({thr_min}–{thr_max})</b><br>
      {legend_rows}
      </div>
