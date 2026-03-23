@@ -873,6 +873,8 @@ m = build_map(
     kind,
     mode_label,
     saved_feature=st.session_state.saved_feature,
+    map_center=st.session_state.map_center,
+    map_zoom=st.session_state.map_zoom,
 )
 
 map_state = st_folium(
@@ -881,6 +883,14 @@ map_state = st_folium(
     width=None,
     key="cygnss_map",   # constant key -> region is not lost across reruns
 )
+
+if map_state is not None:
+    if map_state.get("center") is not None:
+        center_dict = map_state["center"]
+        st.session_state.map_center = [center_dict["lat"], center_dict["lng"]]
+
+    if map_state.get("zoom") is not None:
+        st.session_state.map_zoom = map_state["zoom"]
 
 # Extract the current drawing, if any.
 current_feature = extract_feature_from_map_state(map_state)
