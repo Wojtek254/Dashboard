@@ -15,7 +15,7 @@ from google.oauth2 import service_account
 # CONFIG
 # ---------------------------------------------
 PROJECT_ID = "cygnss-dashboard"
-ASSET_FOLDER = "projects/dahsboard-streamlit-1/assets"
+ASSET_FOLDER = "projects/cygnss-dashboard/CYGNSS"
 
 # Julian days (example window used in the current app)
 START_DOY = 182
