@@ -14,7 +14,7 @@ from google.oauth2 import service_account
 # ---------------------------------------------
 # CONFIG
 # ---------------------------------------------
-PROJECT_ID = "dahsboard-streamlit-1"
+PROJECT_ID = "cygnss-dashboard"
 ASSET_FOLDER = "projects/dahsboard-streamlit-1/assets"
 
 # Julian days (example window used in the current app)
