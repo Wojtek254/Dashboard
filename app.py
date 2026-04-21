@@ -7,11 +7,11 @@ import io
 import altair as alt
 import ee
 import folium
-import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 from folium.plugins import Draw, SideBySideLayers
 from google.oauth2 import service_account
+from PIL import Image, ImageDraw, ImageFont
 from streamlit_folium import st_folium
 
 # ---------------------------------------------
@@ -814,60 +814,76 @@ def plot_pixelcount_timeseries(df, title):
 
 
 def build_png_report(view_info, stats_info):
-    fig, axes = plt.subplots(
-        2,
-        1,
-        figsize=(16, 10),
-        dpi=200,
-        gridspec_kw={"height_ratios": [1.1, 1.4]},
-    )
-    for ax in axes:
-        ax.axis("off")
+    width, height = 2400, 1400
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+    font_title = ImageFont.load_default()
+    font_body = ImageFont.load_default()
+
+    y = 40
+    left_margin = 60
+    line_h = 38
+
+    draw.text((left_margin, y), "CYGNSS Viewer — Snapshot report", fill="black", font=font_title)
+    y += line_h * 2
 
     header_lines = [
-        "CYGNSS Viewer — Snapshot report",
         f"LEFT: {view_info['left_label']}",
         f"RIGHT: {view_info['right_label']}",
         f"Map center: {view_info['map_center'][0]:.4f}, {view_info['map_center'][1]:.4f} | zoom: {view_info['map_zoom']}",
         f"Overlays LEFT: CHIRPS={view_info['left_chirps']}, NDVI={view_info['left_ndvi']}, POP={view_info['left_pop']}",
         f"Overlays RIGHT: CHIRPS={view_info['right_chirps']}, NDVI={view_info['right_ndvi']}, POP={view_info['right_pop']}",
     ]
-    axes[0].text(
-        0.01,
-        0.95,
-        "\n".join(header_lines),
-        va="top",
-        ha="left",
-        fontsize=12,
-        family="monospace",
-    )
+    for line in header_lines:
+        draw.text((left_margin, y), line, fill="black", font=font_body)
+        y += line_h
 
-    stats_rows = [
-        ["Metric", "Value"],
-        ["Stats source", "LEFT asset layer only"],
-        ["Threshold range", f"{stats_info['thr_min']} → {stats_info['thr_max']}"],
-        ["Region drawn", stats_info["region_drawn"]],
-        ["Min", stats_info["min"]],
-        ["Max", stats_info["max"]],
-        ["Mean", stats_info["mean"]],
-        ["In-range pixels", stats_info["count_inrange"]],
-        ["Total valid pixels", stats_info["count_total"]],
+    y += line_h
+    draw.text((left_margin, y), "LEFT statistics", fill="black", font=font_title)
+    y += line_h * 2
+
+    rows = [
+        ("Stats source", "LEFT asset layer only"),
+        ("Threshold range", f"{stats_info['thr_min']} → {stats_info['thr_max']}"),
+        ("Region drawn", stats_info["region_drawn"]),
+        ("Min", stats_info["min"]),
+        ("Max", stats_info["max"]),
+        ("Mean", stats_info["mean"]),
+        ("In-range pixels", stats_info["count_inrange"]),
+        ("Total valid pixels", stats_info["count_total"]),
     ]
-    table = axes[1].table(
-        cellText=stats_rows[1:],
-        colLabels=stats_rows[0],
-        loc="upper left",
-        cellLoc="left",
-        colLoc="left",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(11)
-    table.scale(1.2, 1.6)
 
-    fig.tight_layout()
+    col1_x = left_margin
+    col2_x = 800
+    table_top = y - 14
+    row_h = 48
+    table_w = 2000
+    table_h = row_h * (len(rows) + 1)
+
+    draw.rectangle(
+        [col1_x - 20, table_top, col1_x - 20 + table_w, table_top + table_h],
+        outline="black",
+        width=2,
+    )
+    draw.line(
+        [col2_x - 20, table_top, col2_x - 20, table_top + table_h],
+        fill="black",
+        width=2,
+    )
+    for i in range(1, len(rows) + 1):
+        yline = table_top + i * row_h
+        draw.line([col1_x - 20, yline, col1_x - 20 + table_w, yline], fill="black", width=1)
+
+    draw.text((col1_x, table_top + 10), "Metric", fill="black", font=font_title)
+    draw.text((col2_x, table_top + 10), "Value", fill="black", font=font_title)
+
+    for idx, (k, v) in enumerate(rows, start=1):
+        yrow = table_top + idx * row_h + 10
+        draw.text((col1_x, yrow), str(k), fill="black", font=font_body)
+        draw.text((col2_x, yrow), str(v), fill="black", font=font_body)
+
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=200)
-    plt.close(fig)
+    img.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf.getvalue()
 
