@@ -1,5 +1,5 @@
-# cygnss_regional_dashboard_combined.py
-# pip install streamlit folium earthengine-api streamlit-folium pandas altair
+# app.py
+# pip install streamlit folium earthengine-api streamlit-folium pandas altair google-auth
 
 import streamlit as st
 import ee
@@ -12,15 +12,23 @@ import altair as alt
 from google.oauth2 import service_account
 
 # ---------------------------------------------
+# STREAMLIT PAGE SETUP
+# ---------------------------------------------
+st.set_page_config(
+    page_title="CYGNSS – Regional Viewer (5-band inundation & anomalies)",
+    layout="wide",
+)
+
+# ---------------------------------------------
 # CONFIG
 # ---------------------------------------------
-PROJECT_ID = "dahsboard-streamlit-1"
+PROJECT_ID = st.secrets["project_id"]
 ASSET_FOLDER = f"projects/{PROJECT_ID}/assets"
 
-# Julian days (example window used in the current app)
+# Julian days
 START_DOY = 305
-END_DOY   = 336
-YEAR      = 2025
+END_DOY = 336
+YEAR = 2025
 
 # Build list: [(doy, "YYYY-MM-DD"), ...]
 BASE_DATE = dt.date(YEAR, 1, 1) + dt.timedelta(days=START_DOY - 1)
@@ -37,22 +45,21 @@ DOY_TO_LABEL = {info["doy"]: info["label"] for info in DAYS_INFO}
 MIN_DATE = BASE_DATE
 MAX_DATE = BASE_DATE + dt.timedelta(days=END_DOY - START_DOY)
 
-CENTER = [0, 0]   # default map center
-ZOOM   = 2
+CENTER = [0, 0]
+ZOOM = 2
 
 # Color palette for inundation
 PALETTE_INUND = [
-    "#e3f2fd",  # 0 – very light blue
+    "#e3f2fd",
     "#bbdefb",
     "#90caf9",
     "#64b5f6",
     "#42a5f5",
     "#1e88e5",
-    "#0d47a1",  # maximum – very dark blue
+    "#0d47a1",
 ]
 
 # Color palette for anomalies
-# Negative -> orange, zero -> light blue, positive -> darker blue
 PALETTE_ANOM = [
     "#8c2d04",
     "#fe9929",
@@ -77,7 +84,7 @@ DATA_MODES = {
 # ---------------------------------------------
 def ensure_ee():
     """
-    Initialize the Earth Engine session using credentials
+    Initialize Earth Engine using service account credentials
     stored in Streamlit secrets.
     """
     try:
@@ -90,80 +97,98 @@ def ensure_ee():
         st.error(f"Earth Engine initialization failed: {e}")
         st.stop()
 
+
+def test_asset_access():
+    """
+    Test whether the app can read one known asset.
+    This helps separate IAM/auth errors from rendering errors.
+    """
+    test_path = f"{ASSET_FOLDER}/inundation_5bands_{YEAR}_{START_DOY}"
+    try:
+        img = ee.Image(test_path)
+        info = img.getInfo()
+        bands = [b.get("id", f"band_{i}") for i, b in enumerate(info.get("bands", []))]
+        st.success("Earth Engine initialized and test asset is readable.")
+        with st.expander("Debug: Earth Engine connection"):
+            st.write("PROJECT_ID:", PROJECT_ID)
+            st.write("ASSET_FOLDER:", ASSET_FOLDER)
+            st.write("Test asset:", test_path)
+            st.write("Bands:", bands)
+    except Exception as e:
+        st.error(f"Asset access failed for {test_path}: {e}")
+        st.stop()
+
+
 ensure_ee()
+test_asset_access()
 
 # ---------------------------------------------
 # IMAGE COLLECTIONS
 # ---------------------------------------------
 def build_inund_collection():
     """
-    Build an image collection for inundation assets.
-    Each image is tagged with its day-of-year metadata.
+    Build image collection from all configured asset days.
     """
     imgs = []
     for info in DAYS_INFO:
         day = info["doy"]
-        img = ee.Image(f"{ASSET_FOLDER}/inundation_5bands_{YEAR}_{day}").set("day", day)
+        path = f"{ASSET_FOLDER}/inundation_5bands_{YEAR}_{day}"
+        img = ee.Image(path).set("day", day)
         imgs.append(img)
     return ee.ImageCollection(imgs)
 
+
 IC_INUND = build_inund_collection()
+
 
 def get_collection(kind: str):
     """
-    Return the correct image collection for the selected data type.
+    Return the correct collection for the selected data type.
     """
     return IC_INUND
+
 
 # ---------------------------------------------
 # HELPER FUNCTIONS – INUNDATION
 # ---------------------------------------------
 def mask_inund_band(img, band_index, thr_min, thr_max):
-    """
-    Select one inundation band and mask:
-    - values outside [thr_min, thr_max]
-    - pixels equal to 255 (no data)
-    """
     band = img.select(band_index)
     mask = band.gte(thr_min).And(band.lte(thr_max)).And(band.lt(255))
     return band.updateMask(mask)
 
+
 def inund_valid_band(img, band_index):
-    """
-    Return the selected inundation band with only no-data (255) masked out.
-    """
     band = img.select(band_index)
     return band.updateMask(band.lt(255))
+
 
 # ---------------------------------------------
 # HELPER FUNCTIONS – ANOMALIES
 # ---------------------------------------------
 def anomaly_valid_band(img, band_index):
-    """
-    Return the selected anomaly band with only no-data (255) masked out.
-    """
     band = img.select(band_index)
     return band.updateMask(band.lt(255))
 
+
 def anomaly_thresholded(img, band_index, thr_min, thr_max):
-    """
-    Apply the [thr_min, thr_max] threshold to selected anomaly band.
-    """
     band = anomaly_valid_band(img, band_index)
     thr_mask = band.gte(thr_min).And(band.lte(thr_max))
     return band.updateMask(thr_mask)
+
 
 # ---------------------------------------------
 # BUILD MEAN IMAGE FOR MAP DISPLAY
 # ---------------------------------------------
 def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
     """
-    Compute a pixel-wise mean image over the selected days
-    after applying thresholding and no-data masking.
-    This image is only used for map visualization.
+    Compute pixel-wise mean image over selected days after masking.
     """
     ic = get_collection(kind)
     ic_sel = ic.filter(ee.Filter.inList("day", selected_days))
+
+    size = ic_sel.size().getInfo()
+    if size == 0:
+        raise ValueError(f"No images found for selected days: {selected_days}")
 
     if kind == "inundation":
         ic_proc = ic_sel.map(lambda img: mask_inund_band(img, band_index, thr_min, thr_max))
@@ -173,6 +198,7 @@ def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
     stacked = ic_proc.toBands()
     pixel_mean = stacked.reduce(ee.Reducer.mean())
     return pixel_mean
+
 
 # ---------------------------------------------
 # TIME SERIES FOR AREA (CACHE)
@@ -189,17 +215,6 @@ def compute_region_ts_for_bbox(
     kind,
     band_index,
 ):
-    """
-    Compute time series of min, max, mean, and pixel counts
-    for a rectangular region.
-
-    Important:
-    - min/max/mean are computed AFTER thresholding
-    - count_total is the number of valid pixels for each day
-    - count_inrange is the number of pixels within the threshold range for each day
-
-    This is a day-by-day diagnostic.
-    """
     selected_days = list(selected_days_tuple)
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
     results = []
@@ -266,8 +281,6 @@ def compute_region_ts_for_bbox(
 
     for day in sorted(selected_days):
         img = ic.filter(ee.Filter.eq("day", day)).first()
-        if img is None:
-            continue
 
         if kind == "inundation":
             img_thr = mask_inund_band(img, band_index, thr_min, thr_max)
@@ -276,13 +289,13 @@ def compute_region_ts_for_bbox(
             img_thr = anomaly_thresholded(img, band_index, thr_min, thr_max)
             cnt_tot = region_count_total_anom(img)
 
-        vmin   = region_stat(img_thr, ee.Reducer.min())
-        vmax   = region_stat(img_thr, ee.Reducer.max())
-        vmean  = region_stat(img_thr, ee.Reducer.mean())
+        vmin = region_stat(img_thr, ee.Reducer.min())
+        vmax = region_stat(img_thr, ee.Reducer.max())
+        vmean = region_stat(img_thr, ee.Reducer.mean())
         cnt_in = region_count_inrange(img_thr)
 
-        vmin  = vmin  if vmin  is not None else 0.0
-        vmax  = vmax  if vmax  is not None else 0.0
+        vmin = vmin if vmin is not None else 0.0
+        vmax = vmax if vmax is not None else 0.0
         vmean = vmean if vmean is not None else 0.0
 
         results.append(
@@ -297,6 +310,7 @@ def compute_region_ts_for_bbox(
         )
 
     return results
+
 
 # ---------------------------------------------
 # SUMMARY STATS FOR MEAN IMAGE OVER AREA (CACHE)
@@ -313,10 +327,6 @@ def compute_region_summary_for_bbox(
     kind,
     band_index,
 ):
-    """
-    Compute min, max, and mean for the map mean-image
-    inside the selected rectangular region.
-    """
     selected_days = list(selected_days_tuple)
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
 
@@ -345,10 +355,11 @@ def compute_region_summary_for_bbox(
             return None
         return float(val)
 
-    rmin  = region_stat(pixel_mean, ee.Reducer.min())
-    rmax  = region_stat(pixel_mean, ee.Reducer.max())
+    rmin = region_stat(pixel_mean, ee.Reducer.min())
+    rmax = region_stat(pixel_mean, ee.Reducer.max())
     rmean = region_stat(pixel_mean, ee.Reducer.mean())
     return rmin, rmax, rmean
+
 
 # ---------------------------------------------
 # PIXEL COUNTS FOR SELECTED PERIOD (CACHE)
@@ -365,21 +376,6 @@ def compute_region_pixel_count(
     kind,
     band_index,
 ):
-    """
-    Return two period-based diagnostics for the selected region:
-
-    1) in_range_count:
-       Number of unique pixels that were within the selected threshold
-       at least once during the selected period.
-
-    2) total_count:
-       Number of unique pixels that had valid data at least once
-       during the selected period.
-
-    This is NOT computed from the mean image.
-    This is NOT computed from only the first day.
-    Instead, it uses a temporal OR / union logic across all selected days.
-    """
     selected_days = list(selected_days_tuple)
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
 
@@ -388,42 +384,21 @@ def compute_region_pixel_count(
 
     if kind == "inundation":
         def valid_mask(img):
-            """
-            Binary mask:
-            1 where a pixel is valid (value != 255), 0 otherwise.
-            """
             band = img.select(band_index)
             return band.lt(255).toInt()
 
         def inrange_mask(img):
-            """
-            Binary mask:
-            1 where a pixel is valid and inside the selected threshold range,
-            0 otherwise.
-            """
             band = img.select(band_index)
             return band.gte(thr_min).And(band.lte(thr_max)).And(band.lt(255)).toInt()
-
     else:
         def valid_mask(img):
-            """
-            Binary mask:
-            1 where anomaly data are valid (value != 255), 0 otherwise.
-            """
             band = img.select(band_index)
             return band.lt(255).toInt()
 
         def inrange_mask(img):
-            """
-            Binary mask:
-            1 where anomaly data are valid and
-            values fall within the selected threshold range, 0 otherwise.
-            """
             band = img.select(band_index)
             return band.lt(255).And(band.gte(thr_min)).And(band.lte(thr_max)).toInt()
 
-    # Temporal OR / union:
-    # max() over a stack of 0/1 images returns 1 if the condition was met at least once.
     valid_any = ic_sel.map(valid_mask).max()
     inrange_any = ic_sel.map(inrange_mask).max()
 
@@ -446,14 +421,11 @@ def compute_region_pixel_count(
 
     return in_range_count, total_count
 
+
 # ---------------------------------------------
 # MAP / DRAWING HELPERS
 # ---------------------------------------------
 def extract_feature_from_map_state(map_state):
-    """
-    Extract the latest user-drawn geometry from streamlit-folium state.
-    If no actively edited geometry is present, fall back to the last drawing.
-    """
     feature = None
     if map_state is not None:
         feature = map_state.get("last_active_drawing")
@@ -462,6 +434,7 @@ def extract_feature_from_map_state(map_state):
             if drawings:
                 feature = drawings[-1]
     return feature
+
 
 def build_map(
     image,
@@ -473,117 +446,106 @@ def build_map(
     map_center=None,
     map_zoom=None,
 ):
-    """
-    Build the Folium map used in the dashboard.
+    try:
+        band = image.select(0)
 
-    The map shows:
-    - the mean image over the selected days
-    - the drawing tool for region selection
-    - the previously saved region, if available
-    """
-    band = image.select(0)
+        palette = PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND
+        vis = {
+            "min": thr_min,
+            "max": thr_max,
+            "palette": palette,
+        }
 
-    palette = PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND
+        if map_center is None:
+            map_center = CENTER
+        if map_zoom is None:
+            map_zoom = ZOOM
 
-    vis = {
-        "min": thr_min,
-        "max": thr_max,
-        "palette": palette,
-    }
+        m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
 
-    if map_center is None:
-        map_center = CENTER
-    if map_zoom is None:
-        map_zoom = ZOOM
+        map_id = band.getMapId(vis)
+        tile_url = map_id["tile_fetcher"].url_format
 
-    m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
-
-    map_id = band.getMapId(vis)
-    tile_url = map_id["tile_fetcher"].url_format
-
-    folium.TileLayer(
-        tiles=tile_url,
-        attr="Google Earth Engine",
-        name=f"Mean {mode_label} of selected days",
-        overlay=True,
-        control=True,
-    ).add_to(m)
-
-    # Draw plugin: only rectangles are enabled.
-    Draw(
-        export=False,
-        draw_options={
-            "polyline": False,
-            "polygon": False,
-            "circle": False,
-            "circlemarker": False,
-            "marker": False,
-            "rectangle": {
-                "shapeOptions": {
-                    "color": "#ff8800",
-                    "fillColor": "#ff8800",
-                    "fillOpacity": 0.2,
-                }
-            },
-        },
-        edit_options={"edit": True, "remove": True},
-    ).add_to(m)
-
-    # Re-display the saved region so that changing thresholds/dates
-    # does not visually remove the selected rectangle.
-    if saved_feature is not None:
-        folium.GeoJson(
-            saved_feature,
-            name="Selected region",
-            style_function=lambda x: {
-                "color": "#ff8800",
-                "weight": 2,
-                "fillColor": "#ff8800",
-                "fillOpacity": 0.15,
-            },
+        folium.TileLayer(
+            tiles=tile_url,
+            attr="Google Earth Engine",
+            name=f"Mean {mode_label} of selected days",
+            overlay=True,
+            control=True,
         ).add_to(m)
 
-    # Legend
-    if kind == "anomaly":
-        num_classes = len(PALETTE_ANOM)
-        step = (thr_max - thr_min) / (num_classes - 1) if num_classes > 1 else 1
-        ticks = [thr_min + i * step for i in range(num_classes)]
-        colors = PALETTE_ANOM
-        width = 260
-    else:
-        num_classes = len(PALETTE_INUND)
-        step = (thr_max - thr_min) / (num_classes - 1) if num_classes > 1 else 1
-        ticks = [thr_min + i * step for i in range(num_classes)]
-        colors = PALETTE_INUND
-        width = 220
+        Draw(
+            export=False,
+            draw_options={
+                "polyline": False,
+                "polygon": False,
+                "circle": False,
+                "circlemarker": False,
+                "marker": False,
+                "rectangle": {
+                    "shapeOptions": {
+                        "color": "#ff8800",
+                        "fillColor": "#ff8800",
+                        "fillOpacity": 0.2,
+                    }
+                },
+            },
+            edit_options={"edit": True, "remove": True},
+        ).add_to(m)
 
-    legend_rows = ""
-    for val, col in zip(ticks, colors):
-        legend_rows += (
-            f"<i style='background:{col}; width:18px; height:10px; "
-            f"float:left; margin-right:4px;'></i> {val:.1f}<br>"
-        )
+        if saved_feature is not None:
+            folium.GeoJson(
+                saved_feature,
+                name="Selected region",
+                style_function=lambda x: {
+                    "color": "#ff8800",
+                    "weight": 2,
+                    "fillColor": "#ff8800",
+                    "fillOpacity": 0.15,
+                },
+            ).add_to(m)
 
-    legend_html = f"""
-     <div style='position: fixed; bottom: 40px; left: 40px; width: {width}px;
-         background-color: white; color: black; padding: 10px; border:2px solid grey; z-index:9999;'>
-     <b>{mode_label} ({thr_min}–{thr_max})</b><br>
-     {legend_rows}
-     </div>
-    """
-    m.get_root().html.add_child(folium.Element(legend_html))
+        if kind == "anomaly":
+            num_classes = len(PALETTE_ANOM)
+            step = (thr_max - thr_min) / (num_classes - 1) if num_classes > 1 else 1
+            ticks = [thr_min + i * step for i in range(num_classes)]
+            colors = PALETTE_ANOM
+            width = 260
+        else:
+            num_classes = len(PALETTE_INUND)
+            step = (thr_max - thr_min) / (num_classes - 1) if num_classes > 1 else 1
+            ticks = [thr_min + i * step for i in range(num_classes)]
+            colors = PALETTE_INUND
+            width = 220
 
-    folium.LayerControl().add_to(m)
-    return m
+        legend_rows = ""
+        for val, col in zip(ticks, colors):
+            legend_rows += (
+                f"<i style='background:{col}; width:18px; height:10px; "
+                f"float:left; margin-right:4px;'></i> {val:.1f}<br>"
+            )
+
+        legend_html = f"""
+         <div style='position: fixed; bottom: 40px; left: 40px; width: {width}px;
+             background-color: white; color: black; padding: 10px; border:2px solid grey; z-index:9999;'>
+         <b>{mode_label} ({thr_min}–{thr_max})</b><br>
+         {legend_rows}
+         </div>
+        """
+        m.get_root().html.add_child(folium.Element(legend_html))
+
+        folium.LayerControl().add_to(m)
+        return m
+
+    except Exception as e:
+        st.error(f"Earth Engine map rendering failed: {e}")
+        st.stop()
+
 
 # ---------------------------------------------
 # ALTAIR PLOT – MIN / MAX / MEAN
 # ---------------------------------------------
 def plot_timeseries(df, title, kind, thr_max):
-    """
-    Plot min, max, and mean values over time.
-    These statistics are computed after thresholding.
-    """
     if df.empty:
         return
 
@@ -593,7 +555,7 @@ def plot_timeseries(df, title, kind, thr_max):
     if kind == "anomaly":
         ymin = float(df_plot[["min", "mean", "max"]].min().min())
         ymax = float(df_plot[["min", "mean", "max"]].max().max())
-        pad  = 0.1 * max(1.0, abs(ymin) + abs(ymax))
+        pad = 0.1 * max(1.0, abs(ymin) + abs(ymax))
         y_lower = ymin - pad
         y_upper = ymax + pad
         y_title = "Anomaly value"
@@ -632,19 +594,11 @@ def plot_timeseries(df, title, kind, thr_max):
     )
     st.altair_chart(chart, use_container_width=True)
 
+
 # ---------------------------------------------
 # ALTAIR PLOT – PIXEL COUNTS PER DAY
 # ---------------------------------------------
 def plot_pixelcount_timeseries(df, title):
-    """
-    Plot a stacked bar chart:
-    - in-range pixels
-    - out-of-range pixels
-    for each individual day.
-
-    This is a daily diagnostic and is different from the top summary metrics,
-    which now use a temporal union over the selected period.
-    """
     required_cols = {"count_total", "count_inrange"}
     if df.empty or not required_cols.issubset(df.columns):
         return
@@ -698,14 +652,8 @@ def plot_pixelcount_timeseries(df, title):
         alt.Chart(df_plot)
         .mark_text(dy=-6)
         .encode(
-            x=alt.X(
-                "date_str:N",
-                sort=df_plot["date_str"].tolist(),
-            ),
-            y=alt.Y(
-                "count_total:Q",
-                scale=alt.Scale(domain=[0, y_upper]),
-            ),
+            x=alt.X("date_str:N", sort=df_plot["date_str"].tolist()),
+            y=alt.Y("count_total:Q", scale=alt.Scale(domain=[0, y_upper])),
             text=alt.Text("count_total:Q", format="d"),
         )
     )
@@ -717,14 +665,10 @@ def plot_pixelcount_timeseries(df, title):
 
     st.altair_chart(chart, use_container_width=True)
 
-# ---------------------------------------------
-# STREAMLIT PAGE SETUP
-# ---------------------------------------------
-st.set_page_config(
-    page_title="CYGNSS – Regional Viewer (5-band inundation & anomalies)",
-    layout="wide",
-)
 
+# ---------------------------------------------
+# APP HEADER
+# ---------------------------------------------
 st.title("CYGNSS – Regional Viewer")
 st.caption(
     "Explore CYGNSS inundation products (bands 1-5) from Google Earth Engine. "
@@ -733,7 +677,7 @@ st.caption(
 )
 
 # ---------------------------------------------
-# SESSION STATE FOR SAVED REGION
+# SESSION STATE
 # ---------------------------------------------
 if "saved_feature" not in st.session_state:
     st.session_state.saved_feature = None
@@ -744,9 +688,9 @@ if "map_center" not in st.session_state:
 if "map_zoom" not in st.session_state:
     st.session_state.map_zoom = ZOOM
 
-# Optional button to clear the saved region
 if st.button("Clear selected region"):
     st.session_state.saved_feature = None
+
 
 # ---------------------------------------------
 # 0) DATA TYPE SELECTION
@@ -767,13 +711,12 @@ st.markdown("### Select date range")
 
 date_range = st.date_input(
     "Date range (from–to):",
-    value=(MIN_DATE, MIN_DATE),   # default: single day
+    value=(MIN_DATE, MIN_DATE),
     min_value=MIN_DATE,
     max_value=MAX_DATE,
     format="YYYY-MM-DD",
 )
 
-# Streamlit can return either a single date or a tuple
 if isinstance(date_range, tuple):
     if len(date_range) != 2 or date_range[0] is None or date_range[1] is None:
         st.stop()
@@ -781,15 +724,12 @@ if isinstance(date_range, tuple):
 else:
     start_date = end_date = date_range
 
-# Sort the dates if selected in reverse order
 if start_date > end_date:
     start_date, end_date = end_date, start_date
 
-# Clip to valid data availability
 start_date = max(start_date, MIN_DATE)
-end_date   = min(end_date, MAX_DATE)
+end_date = min(end_date, MAX_DATE)
 
-# Build the list of selected dates
 selected_dates = []
 current_date = start_date
 while current_date <= end_date:
@@ -807,14 +747,12 @@ sel_days = [
 ]
 
 if not sel_days:
+    st.warning("No valid dataset days found in the selected range.")
     st.stop()
 
 sel_days_tuple = tuple(sorted(sel_days))
 
-st.write(
-    "Dates used:",
-    ", ".join(d.strftime("%Y-%m-%d") for d in selected_dates),
-)
+st.write("Dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in selected_dates))
 
 # ---------------------------------------------
 # 2) THRESHOLD SELECTION
@@ -843,7 +781,11 @@ if thr_min >= thr_max:
 # ---------------------------------------------
 # BUILD MEAN IMAGE FOR MAP
 # ---------------------------------------------
-mean_image = build_mean_image(sel_days, thr_min, thr_max, kind, band_index)
+try:
+    mean_image = build_mean_image(sel_days, thr_min, thr_max, kind, band_index)
+except Exception as e:
+    st.error(f"Failed to build mean image: {e}")
+    st.stop()
 
 # ---------------------------------------------
 # BUILD / DISPLAY MAP
@@ -863,7 +805,7 @@ map_state = st_folium(
     m,
     height=650,
     width=None,
-    key="cygnss_map",   # constant key -> region is not lost across reruns
+    key="cygnss_map",
 )
 
 if map_state is not None:
@@ -874,14 +816,11 @@ if map_state is not None:
     if map_state.get("zoom") is not None:
         st.session_state.map_zoom = map_state["zoom"]
 
-# Extract the current drawing, if any.
 current_feature = extract_feature_from_map_state(map_state)
 
-# Save the most recent valid geometry to session state.
 if current_feature and "geometry" in current_feature:
     st.session_state.saved_feature = current_feature
 
-# Always use the saved region if available.
 feature = st.session_state.saved_feature
 
 st.markdown("---")
@@ -897,7 +836,6 @@ if feature and "geometry" in feature:
     geom = feature["geometry"]
     coords = geom.get("coordinates", [])
 
-    # Rectangle coordinates come as a polygon ring.
     if coords and isinstance(coords[0], list):
         ring = coords[0]
         lons = [c[0] for c in ring]
@@ -941,11 +879,7 @@ if feature and "geometry" in feature:
             band_index,
         )
 
-        # Display a message if there are no valid pixels at all in the selected period.
-        if (
-            any(v is None for v in (user_min, user_max, user_mean))
-            or pixel_count_total == 0
-        ):
+        if any(v is None for v in (user_min, user_max, user_mean)) or pixel_count_total == 0:
             st.info(
                 "There are no valid pixels in the selected area "
                 "for the chosen thresholds/scale. Try a larger area or different thresholds."
@@ -981,11 +915,7 @@ if feature and "geometry" in feature:
                     plot_timeseries(df_r, title_ts, kind, thr_max)
 
                 with col_cnt:
-                    title_cnt = (
-                        f"Daily pixel counts in area ({mode_label})"
-                        if kind == "anomaly"
-                        else f"Daily pixel counts in area ({mode_label})"
-                    )
+                    title_cnt = f"Daily pixel counts in area ({mode_label})"
                     plot_pixelcount_timeseries(df_r, title_cnt)
             else:
                 st.info("No data available to draw time series for the selected area (after masking).")
