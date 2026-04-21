@@ -2,10 +2,12 @@
 # pip install streamlit folium earthengine-api streamlit-folium pandas altair google-auth
 
 import datetime as dt
+import io
 
 import altair as alt
 import ee
 import folium
+import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 from folium.plugins import Draw, SideBySideLayers
@@ -260,7 +262,7 @@ def add_optional_overlays(base_rgb, start_date, end_date, add_chirps, add_ndvi, 
         )
         chirps_vis = chirps.visualize(
             min=0,
-            max=300,
+            max=20,
             palette=["#f7fbff", "#6baed6", "#2171b5", "#08306b"],
             opacity=0.55,
         )
@@ -811,6 +813,65 @@ def plot_pixelcount_timeseries(df, title):
     st.altair_chart(chart, use_container_width=True)
 
 
+def build_png_report(view_info, stats_info):
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(16, 10),
+        dpi=200,
+        gridspec_kw={"height_ratios": [1.1, 1.4]},
+    )
+    for ax in axes:
+        ax.axis("off")
+
+    header_lines = [
+        "CYGNSS Viewer — Snapshot report",
+        f"LEFT: {view_info['left_label']}",
+        f"RIGHT: {view_info['right_label']}",
+        f"Map center: {view_info['map_center'][0]:.4f}, {view_info['map_center'][1]:.4f} | zoom: {view_info['map_zoom']}",
+        f"Overlays LEFT: CHIRPS={view_info['left_chirps']}, NDVI={view_info['left_ndvi']}, POP={view_info['left_pop']}",
+        f"Overlays RIGHT: CHIRPS={view_info['right_chirps']}, NDVI={view_info['right_ndvi']}, POP={view_info['right_pop']}",
+    ]
+    axes[0].text(
+        0.01,
+        0.95,
+        "\n".join(header_lines),
+        va="top",
+        ha="left",
+        fontsize=12,
+        family="monospace",
+    )
+
+    stats_rows = [
+        ["Metric", "Value"],
+        ["Stats source", "LEFT asset layer only"],
+        ["Threshold range", f"{stats_info['thr_min']} → {stats_info['thr_max']}"],
+        ["Region drawn", stats_info["region_drawn"]],
+        ["Min", stats_info["min"]],
+        ["Max", stats_info["max"]],
+        ["Mean", stats_info["mean"]],
+        ["In-range pixels", stats_info["count_inrange"]],
+        ["Total valid pixels", stats_info["count_total"]],
+    ]
+    table = axes[1].table(
+        cellText=stats_rows[1:],
+        colLabels=stats_rows[0],
+        loc="upper left",
+        cellLoc="left",
+        colLoc="left",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1.2, 1.6)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 # ---------------------------------------------
 # APP HEADER
 # ---------------------------------------------
@@ -1073,12 +1134,16 @@ st.subheader("Statistics and pixel counts for the drawn area (LEFT asset layer o
 
 user_min = user_max = user_mean = None
 left_sel_days_tuple = tuple(left_sel_days)
+pixel_count_inrange = None
+pixel_count_total = None
+region_drawn = "No"
 
 if feature and "geometry" in feature:
     geom = feature["geometry"]
     coords = geom.get("coordinates", [])
 
     if coords and isinstance(coords[0], list):
+        region_drawn = "Yes"
         ring = coords[0]
         lons = [c[0] for c in ring]
         lats = [c[1] for c in ring]
@@ -1165,3 +1230,38 @@ if feature and "geometry" in feature:
         st.info("Draw a rectangular area on the map using the drawing tool.")
 else:
     st.info("Draw a rectangular area on the map using the drawing tool (rectangle icon in the top-left corner).")
+
+st.markdown("---")
+st.subheader("Export PNG")
+
+view_info = {
+    "left_label": left_label,
+    "right_label": right_label if right_label is not None else "Split view disabled",
+    "map_center": st.session_state.map_center,
+    "map_zoom": st.session_state.map_zoom,
+    "left_chirps": left_add_chirps,
+    "left_ndvi": left_add_ndvi,
+    "left_pop": left_add_population,
+    "right_chirps": right_add_chirps if split_view else False,
+    "right_ndvi": right_add_ndvi if split_view else False,
+    "right_pop": right_add_population if split_view else False,
+}
+
+stats_info = {
+    "thr_min": left_thr_min,
+    "thr_max": left_thr_max,
+    "region_drawn": region_drawn,
+    "min": f"{user_min:.4f}" if user_min is not None else "N/A",
+    "max": f"{user_max:.4f}" if user_max is not None else "N/A",
+    "mean": f"{user_mean:.4f}" if user_mean is not None else "N/A",
+    "count_inrange": str(pixel_count_inrange) if pixel_count_inrange is not None else "N/A",
+    "count_total": str(pixel_count_total) if pixel_count_total is not None else "N/A",
+}
+
+png_bytes = build_png_report(view_info=view_info, stats_info=stats_info)
+st.download_button(
+    label="Download current view/statistics as PNG",
+    data=png_bytes,
+    file_name=f"cygnss_snapshot_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png",
+    mime="image/png",
+)
