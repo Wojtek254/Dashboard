@@ -14,7 +14,7 @@ from google.oauth2 import service_account
 # ---------------------------------------------
 # CONFIG
 # ---------------------------------------------
-PROJECT_ID = "dashboard-streamlit-1"
+PROJECT_ID = None
 ASSET_FOLDER = "projects/dashboard-streamlit-1/assets"
 
 # Julian days (example window used in the current app)
