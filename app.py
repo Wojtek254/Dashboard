@@ -4,7 +4,7 @@
 import streamlit as st
 import ee
 import folium
-from folium.plugins import Draw
+from folium.plugins import Draw, SideBySideLayers
 from streamlit_folium import st_folium
 import datetime as dt
 import pandas as pd
@@ -437,17 +437,19 @@ def extract_feature_from_map_state(map_state):
 
 
 def build_map(
-    image,
+    left_image,
     thr_min,
     thr_max,
     kind,
-    mode_label,
+    left_label,
     saved_feature=None,
     map_center=None,
     map_zoom=None,
+    right_image=None,
+    right_label=None,
 ):
     try:
-        band = image.select(0)
+        left_band = left_image.select(0)
 
         palette = PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND
         vis = {
@@ -463,16 +465,35 @@ def build_map(
 
         m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
 
-        map_id = band.getMapId(vis)
-        tile_url = map_id["tile_fetcher"].url_format
+        left_map_id = left_band.getMapId(vis)
+        left_tile_url = left_map_id["tile_fetcher"].url_format
 
-        folium.TileLayer(
-            tiles=tile_url,
+        left_layer = folium.TileLayer(
+            tiles=left_tile_url,
             attr="Google Earth Engine",
-            name=f"Mean {mode_label} of selected days",
+            name=left_label,
             overlay=True,
             control=True,
-        ).add_to(m)
+        )
+        left_layer.add_to(m)
+
+        if right_image is not None:
+            right_band = right_image.select(0)
+            right_map_id = right_band.getMapId(vis)
+            right_tile_url = right_map_id["tile_fetcher"].url_format
+
+            if right_label is None:
+                right_label = "Right layer"
+
+            right_layer = folium.TileLayer(
+                tiles=right_tile_url,
+                attr="Google Earth Engine",
+                name=right_label,
+                overlay=True,
+                control=True,
+            )
+            right_layer.add_to(m)
+            SideBySideLayers(left_layer=left_layer, right_layer=right_layer).add_to(m)
 
         Draw(
             export=False,
@@ -528,7 +549,7 @@ def build_map(
         legend_html = f"""
          <div style='position: fixed; bottom: 40px; left: 40px; width: {width}px;
              background-color: white; color: black; padding: 10px; border:2px solid grey; z-index:9999;'>
-         <b>{mode_label} ({thr_min}–{thr_max})</b><br>
+         <b>{left_label} ({thr_min}–{thr_max})</b><br>
          {legend_rows}
          </div>
         """
@@ -704,6 +725,11 @@ mode_cfg = DATA_MODES[mode_label]
 kind = mode_cfg["kind"]
 band_index = mode_cfg["band_index"]
 
+split_view = st.checkbox(
+    "Enable split-view map comparison (left vs right)",
+    value=False,
+)
+
 # ---------------------------------------------
 # 1) DATE RANGE SELECTION
 # ---------------------------------------------
@@ -754,6 +780,26 @@ sel_days_tuple = tuple(sorted(sel_days))
 
 st.write("Dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in selected_dates))
 
+right_sel_days = None
+right_label = None
+
+if split_view:
+    compare_date = st.date_input(
+        "Comparison date for RIGHT side:",
+        value=selected_dates[-1],
+        min_value=MIN_DATE,
+        max_value=MAX_DATE,
+        format="YYYY-MM-DD",
+    )
+
+    compare_doy = (compare_date - dt.date(YEAR, 1, 1)).days + 1
+    if not (START_DOY <= compare_doy <= END_DOY):
+        st.warning("Comparison date is outside the available dataset range.")
+        st.stop()
+
+    right_sel_days = [compare_doy]
+    right_label = f"{mode_label} | RIGHT: {compare_date.strftime('%Y-%m-%d')}"
+
 # ---------------------------------------------
 # 2) THRESHOLD SELECTION
 # ---------------------------------------------
@@ -787,18 +833,28 @@ except Exception as e:
     st.error(f"Failed to build mean image: {e}")
     st.stop()
 
+right_image = None
+if split_view and right_sel_days is not None:
+    try:
+        right_image = build_mean_image(right_sel_days, thr_min, thr_max, kind, band_index)
+    except Exception as e:
+        st.error(f"Failed to build comparison image: {e}")
+        st.stop()
+
 # ---------------------------------------------
 # BUILD / DISPLAY MAP
 # ---------------------------------------------
 m = build_map(
-    mean_image,
-    thr_min,
-    thr_max,
-    kind,
-    mode_label,
+    left_image=mean_image,
+    thr_min=thr_min,
+    thr_max=thr_max,
+    kind=kind,
+    left_label=f"{mode_label} | LEFT: {start_date.strftime('%Y-%m-%d')}→{end_date.strftime('%Y-%m-%d')}",
     saved_feature=st.session_state.saved_feature,
     map_center=st.session_state.map_center,
     map_zoom=st.session_state.map_zoom,
+    right_image=right_image,
+    right_label=right_label,
 )
 
 map_state = st_folium(
