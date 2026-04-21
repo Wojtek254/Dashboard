@@ -917,7 +917,12 @@ def render_fullpage_screenshot_button():
               status.textContent = "Preparing screenshot...";
               const h2c = await loadHtml2Canvas();
               const target = window.parent.document.body;
-              const scale = Math.max(2, window.parent.devicePixelRatio || 2);
+              const desiredScale = Math.max(2, window.parent.devicePixelRatio || 2);
+              const maxDim = 8000; // keep file safe for viewers
+              const rawW = target.scrollWidth * desiredScale;
+              const rawH = target.scrollHeight * desiredScale;
+              const limiter = Math.max(rawW / maxDim, rawH / maxDim, 1);
+              const scale = desiredScale / limiter;
               const canvas = await h2c(target, {
                 useCORS: true,
                 allowTaint: true,
@@ -932,9 +937,17 @@ def render_fullpage_screenshot_button():
               });
               const a = document.createElement("a");
               a.download = "dashboard_fullpage_screenshot.png";
-              a.href = canvas.toDataURL("image/png");
-              a.click();
-              status.textContent = "PNG downloaded.";
+              canvas.toBlob((blob) => {
+                if (!blob) {
+                  status.textContent = "Screenshot failed: empty PNG blob.";
+                  return;
+                }
+                const url = URL.createObjectURL(blob);
+                a.href = url;
+                a.click();
+                setTimeout(() => URL.revokeObjectURL(url), 2000);
+                status.textContent = "PNG downloaded.";
+              }, "image/png");
             } catch (e) {
               status.textContent = "Screenshot failed (browser CORS/security).";
             }
