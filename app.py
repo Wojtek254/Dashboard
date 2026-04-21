@@ -493,7 +493,7 @@ def build_map(
                 control=True,
             )
             right_layer.add_to(m)
-            SideBySideLayers(left_layer=left_layer, right_layer=right_layer).add_to(m)
+            SideBySideLayers(left_layer, right_layer).add_to(m)
 
         Draw(
             export=False,
