@@ -14,15 +14,15 @@ from google.oauth2 import service_account
 # ---------------------------------------------
 # CONFIG
 # ---------------------------------------------
-PROJECT_ID = "cygnss-dashboard"
-ASSET_FOLDER = "projects/cygnss-dashboard/CYGNSS"
+PROJECT_ID = "dashboard-streamlit-1"
+ASSET_FOLDER = "projects/dashboard-streamlit-1/assets"
 
 # Julian days (example window used in the current app)
-START_DOY = 182
-END_DOY   = 212
-YEAR      = 2021
+START_DOY = 305
+END_DOY   = 336
+YEAR      = 2025
 
-# Build list: [(doy, "2021-07-01"), ...]
+# Build list: [(doy, "YYYY-MM-DD"), ...]
 BASE_DATE = dt.date(YEAR, 1, 1) + dt.timedelta(days=START_DOY - 1)
 DAYS_INFO = [
     {
@@ -65,9 +65,11 @@ PALETTE_ANOM = [
 
 # Supported data modes
 DATA_MODES = {
-    "Inundation – band 3": {"kind": "inundation", "band_index": 2},
-    "Inundation – band 1": {"kind": "inundation", "band_index": 0},
-    "Anomaly – band 3":    {"kind": "anomaly",    "band_index": 0},  # single-band anomaly asset
+    "Daily observations (band 1)": {"kind": "inundation", "band_index": 0},
+    "3-daily interpolated data (band 2)": {"kind": "inundation", "band_index": 1},
+    "Interpolation flux (band 3)": {"kind": "inundation", "band_index": 2},
+    "1-day inundation anomalies (band 4)": {"kind": "anomaly", "band_index": 3},
+    "Interpolated inundation anomalies (band 5)": {"kind": "anomaly", "band_index": 4},
 }
 
 # ---------------------------------------------
@@ -101,32 +103,17 @@ def build_inund_collection():
     imgs = []
     for info in DAYS_INFO:
         day = info["doy"]
-        img = ee.Image(f"{ASSET_FOLDER}/inundation_CYGNSS_3bands_2021_{day}").set("day", day)
-        imgs.append(img)
-    return ee.ImageCollection(imgs)
-
-def build_anom_collection():
-    """
-    Build an image collection for anomaly assets.
-    Assumed asset pattern:
-        {ASSET_FOLDER}/2021_{DOY}_anomaly
-    """
-    imgs = []
-    for info in DAYS_INFO:
-        day = info["doy"]
-        asset_id = f"{ASSET_FOLDER}/2021_{day}_anomaly"
-        img = ee.Image(asset_id).set("day", day)
+        img = ee.Image(f"{ASSET_FOLDER}/inundation_5bands_{YEAR}_{day}").set("day", day)
         imgs.append(img)
     return ee.ImageCollection(imgs)
 
 IC_INUND = build_inund_collection()
-IC_ANOM  = build_anom_collection()
 
 def get_collection(kind: str):
     """
     Return the correct image collection for the selected data type.
     """
-    return IC_INUND if kind == "inundation" else IC_ANOM
+    return IC_INUND
 
 # ---------------------------------------------
 # HELPER FUNCTIONS – INUNDATION
@@ -151,24 +138,20 @@ def inund_valid_band(img, band_index):
 # ---------------------------------------------
 # HELPER FUNCTIONS – ANOMALIES
 # ---------------------------------------------
-def anomaly_band3_corrected(img):
+def anomaly_valid_band(img, band_index):
     """
-    Use anomaly band 3 (single band: index 0),
-    treat 255 as no data, and subtract 100
-    because anomaly values were stored with an offset.
+    Return the selected anomaly band with only no-data (255) masked out.
     """
-    raw = img.select(0)
-    valid_mask = raw.neq(255)
-    corrected = raw.subtract(100).updateMask(valid_mask)
-    return corrected
+    band = img.select(band_index)
+    return band.updateMask(band.lt(255))
 
-def anomaly_band3_thresholded(img, thr_min, thr_max):
+def anomaly_thresholded(img, band_index, thr_min, thr_max):
     """
-    Correct anomalies first, then apply the [thr_min, thr_max] threshold.
+    Apply the [thr_min, thr_max] threshold to selected anomaly band.
     """
-    corr = anomaly_band3_corrected(img)
-    thr_mask = corr.gte(thr_min).And(corr.lte(thr_max))
-    return corr.updateMask(thr_mask)
+    band = anomaly_valid_band(img, band_index)
+    thr_mask = band.gte(thr_min).And(band.lte(thr_max))
+    return band.updateMask(thr_mask)
 
 # ---------------------------------------------
 # BUILD MEAN IMAGE FOR MAP DISPLAY
@@ -185,7 +168,7 @@ def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
     if kind == "inundation":
         ic_proc = ic_sel.map(lambda img: mask_inund_band(img, band_index, thr_min, thr_max))
     else:
-        ic_proc = ic_sel.map(lambda img: anomaly_band3_thresholded(img, thr_min, thr_max))
+        ic_proc = ic_sel.map(lambda img: anomaly_thresholded(img, band_index, thr_min, thr_max))
 
     stacked = ic_proc.toBands()
     pixel_mean = stacked.reduce(ee.Reducer.mean())
@@ -267,8 +250,8 @@ def compute_region_ts_for_bbox(
         return int(val)
 
     def region_count_total_anom(img):
-        corr = anomaly_band3_corrected(img)
-        d = corr.reduceRegion(
+        band_valid = anomaly_valid_band(img, band_index)
+        d = band_valid.reduceRegion(
             reducer=ee.Reducer.count(),
             geometry=region,
             scale=3000,
@@ -290,7 +273,7 @@ def compute_region_ts_for_bbox(
             img_thr = mask_inund_band(img, band_index, thr_min, thr_max)
             cnt_tot = region_count_total_inund(img)
         else:
-            img_thr = anomaly_band3_thresholded(img, thr_min, thr_max)
+            img_thr = anomaly_thresholded(img, band_index, thr_min, thr_max)
             cnt_tot = region_count_total_anom(img)
 
         vmin   = region_stat(img_thr, ee.Reducer.min())
@@ -343,7 +326,7 @@ def compute_region_summary_for_bbox(
     if kind == "inundation":
         ic_proc = ic_sel.map(lambda img: mask_inund_band(img, band_index, thr_min, thr_max))
     else:
-        ic_proc = ic_sel.map(lambda img: anomaly_band3_thresholded(img, thr_min, thr_max))
+        ic_proc = ic_sel.map(lambda img: anomaly_thresholded(img, band_index, thr_min, thr_max))
 
     stacked = ic_proc.toBands()
     pixel_mean = stacked.reduce(ee.Reducer.mean())
@@ -427,18 +410,17 @@ def compute_region_pixel_count(
             Binary mask:
             1 where anomaly data are valid (value != 255), 0 otherwise.
             """
-            raw = img.select(0)
-            return raw.neq(255).toInt()
+            band = img.select(band_index)
+            return band.lt(255).toInt()
 
         def inrange_mask(img):
             """
             Binary mask:
-            1 where anomaly data are valid and corrected anomaly values
-            fall within the selected threshold range, 0 otherwise.
+            1 where anomaly data are valid and
+            values fall within the selected threshold range, 0 otherwise.
             """
-            raw = img.select(0)
-            corr = raw.subtract(100)
-            return raw.neq(255).And(corr.gte(thr_min)).And(corr.lte(thr_max)).toInt()
+            band = img.select(band_index)
+            return band.lt(255).And(band.gte(thr_min)).And(band.lte(thr_max)).toInt()
 
     # Temporal OR / union:
     # max() over a stack of 0/1 images returns 1 if the condition was met at least once.
@@ -739,13 +721,13 @@ def plot_pixelcount_timeseries(df, title):
 # STREAMLIT PAGE SETUP
 # ---------------------------------------------
 st.set_page_config(
-    page_title="CYGNSS – Regional Viewer (Inundation & Anomalies)",
+    page_title="CYGNSS – Regional Viewer (5-band inundation & anomalies)",
     layout="wide",
 )
 
 st.title("CYGNSS – Regional Viewer")
 st.caption(
-    "Explore CYGNSS inundation (bands 1 & 3) and anomaly band 3 from Google Earth Engine. "
+    "Explore CYGNSS inundation products (bands 1-5) from Google Earth Engine. "
     "The map shows the mean of selected days for the chosen data type after applying thresholds. "
     "Draw an area (rectangle) on the map to compute regional statistics and pixel counts."
 )
@@ -839,7 +821,7 @@ st.write(
 # ---------------------------------------------
 if kind == "anomaly":
     thr_min, thr_max = st.slider(
-        "Anomaly range (lower and upper threshold, band 3 after -100 offset):",
+        "Anomaly range (lower and upper threshold):",
         min_value=-100,
         max_value=100,
         value=(-20, 20),
@@ -992,7 +974,7 @@ if feature and "geometry" in feature:
 
                 with col_ts:
                     title_ts = (
-                        "Min / Max / Mean anomaly time series (area, band 3)"
+                        f"Min / Max / Mean anomaly time series (area, {mode_label})"
                         if kind == "anomaly"
                         else f"Min / Max / Mean time series (area, {mode_label})"
                     )
@@ -1000,7 +982,7 @@ if feature and "geometry" in feature:
 
                 with col_cnt:
                     title_cnt = (
-                        "Daily pixel counts in area (anomaly band 3)"
+                        f"Daily pixel counts in area ({mode_label})"
                         if kind == "anomaly"
                         else f"Daily pixel counts in area ({mode_label})"
                     )
