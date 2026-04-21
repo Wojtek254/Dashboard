@@ -1,15 +1,16 @@
 # app.py
 # pip install streamlit folium earthengine-api streamlit-folium pandas altair google-auth
 
-import streamlit as st
+import datetime as dt
+
+import altair as alt
 import ee
 import folium
-from folium.plugins import Draw, SideBySideLayers
-from streamlit_folium import st_folium
-import datetime as dt
 import pandas as pd
-import altair as alt
+import streamlit as st
+from folium.plugins import Draw, SideBySideLayers
 from google.oauth2 import service_account
+from streamlit_folium import st_folium
 
 # ---------------------------------------------
 # STREAMLIT PAGE SETUP
@@ -70,14 +71,22 @@ PALETTE_ANOM = [
     "#0d47a1",
 ]
 
-# Supported data modes
-DATA_MODES = {
-    "Daily observations (band 1)": {"kind": "inundation", "band_index": 0},
-    "3-daily interpolated data (band 2)": {"kind": "inundation", "band_index": 1},
-    "Interpolation flux (band 3)": {"kind": "inundation", "band_index": 2},
-    "1-day inundation anomalies (band 4)": {"kind": "anomaly", "band_index": 3},
-    "Interpolated inundation anomalies (band 5)": {"kind": "anomaly", "band_index": 4},
+BAND_OPTIONS = {
+    1: "Daily observations",
+    2: "3-daily interpolated data",
+    3: "Interpolation flux",
+    4: "1-day inundation anomalies",
+    5: "Interpolated inundation anomalies",
 }
+
+CHIRPS_COLLECTION = "UCSB-CHG/CHIRPS/DAILY"
+NDVI_COLLECTION = "MODIS/061/MOD13Q1"
+POP_COLLECTION = "CIESIN/GPWv411/GPW_Population_Count"
+
+
+def band_kind(band_number: int) -> str:
+    return "anomaly" if band_number in (4, 5) else "inundation"
+
 
 # ---------------------------------------------
 # INITIALIZE GOOGLE EARTH ENGINE
@@ -121,6 +130,7 @@ def test_asset_access():
 
 ensure_ee()
 test_asset_access()
+
 
 # ---------------------------------------------
 # IMAGE COLLECTIONS
@@ -177,6 +187,41 @@ def anomaly_thresholded(img, band_index, thr_min, thr_max):
 
 
 # ---------------------------------------------
+# DATE HELPERS
+# ---------------------------------------------
+def parse_date_range(date_value):
+    if isinstance(date_value, tuple):
+        if len(date_value) != 2 or date_value[0] is None or date_value[1] is None:
+            return None, None
+        start_date, end_date = date_value
+    else:
+        start_date = end_date = date_value
+
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    start_date = max(start_date, MIN_DATE)
+    end_date = min(end_date, MAX_DATE)
+    return start_date, end_date
+
+
+def dates_to_doys(start_date, end_date):
+    selected_dates = []
+    current_date = start_date
+    while current_date <= end_date:
+        selected_dates.append(current_date)
+        current_date += dt.timedelta(days=1)
+
+    year_start = dt.date(YEAR, 1, 1)
+    doys = [
+        (d - year_start).days + 1
+        for d in selected_dates
+        if START_DOY <= (d - year_start).days + 1 <= END_DOY
+    ]
+    return selected_dates, sorted(doys)
+
+
+# ---------------------------------------------
 # BUILD MEAN IMAGE FOR MAP DISPLAY
 # ---------------------------------------------
 def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
@@ -198,6 +243,92 @@ def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
     stacked = ic_proc.toBands()
     pixel_mean = stacked.reduce(ee.Reducer.mean())
     return pixel_mean
+
+
+def add_optional_overlays(base_rgb, start_date, end_date, add_chirps, add_ndvi, add_population):
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_exclusive = (end_date + dt.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    out = base_rgb
+
+    if add_chirps:
+        chirps = (
+            ee.ImageCollection(CHIRPS_COLLECTION)
+            .filterDate(start_str, end_exclusive)
+            .select("precipitation")
+            .sum()
+        )
+        chirps_vis = chirps.visualize(
+            min=0,
+            max=300,
+            palette=["#f7fbff", "#6baed6", "#2171b5", "#08306b"],
+            opacity=0.55,
+        )
+        out = out.blend(chirps_vis)
+
+    if add_ndvi:
+        ndvi = (
+            ee.ImageCollection(NDVI_COLLECTION)
+            .filterDate(start_str, end_exclusive)
+            .select("NDVI")
+            .mean()
+            .multiply(0.0001)
+        )
+        ndvi_vis = ndvi.visualize(
+            min=0.0,
+            max=0.8,
+            palette=["#f7fcf5", "#a1d99b", "#31a354", "#006d2c"],
+            opacity=0.55,
+        )
+        out = out.blend(ndvi_vis)
+
+    if add_population:
+        pop = (
+            ee.ImageCollection(POP_COLLECTION)
+            .sort("system:time_start", False)
+            .first()
+            .select("population_count")
+        )
+        pop_vis = pop.visualize(
+            min=0,
+            max=1000,
+            palette=["#ffffcc", "#ffeda0", "#feb24c", "#f03b20", "#bd0026"],
+            opacity=0.5,
+        )
+        out = out.blend(pop_vis)
+
+    return out
+
+
+def build_side_visual_image(
+    selected_days,
+    thr_min,
+    thr_max,
+    kind,
+    band_index,
+    start_date,
+    end_date,
+    add_chirps,
+    add_ndvi,
+    add_population,
+):
+    mean_image = build_mean_image(selected_days, thr_min, thr_max, kind, band_index)
+    palette = PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND
+
+    base_rgb = mean_image.select(0).visualize(
+        min=thr_min,
+        max=thr_max,
+        palette=palette,
+    )
+
+    return add_optional_overlays(
+        base_rgb,
+        start_date,
+        end_date,
+        add_chirps=add_chirps,
+        add_ndvi=add_ndvi,
+        add_population=add_population,
+    )
 
 
 # ---------------------------------------------
@@ -383,6 +514,7 @@ def compute_region_pixel_count(
     ic_sel = ic.filter(ee.Filter.inList("day", selected_days))
 
     if kind == "inundation":
+
         def valid_mask(img):
             band = img.select(band_index)
             return band.lt(255).toInt()
@@ -390,7 +522,9 @@ def compute_region_pixel_count(
         def inrange_mask(img):
             band = img.select(band_index)
             return band.gte(thr_min).And(band.lte(thr_max)).And(band.lt(255)).toInt()
+
     else:
+
         def valid_mask(img):
             band = img.select(band_index)
             return band.lt(255).toInt()
@@ -437,27 +571,18 @@ def extract_feature_from_map_state(map_state):
 
 
 def build_map(
-    left_image,
-    thr_min,
-    thr_max,
-    kind,
+    left_visual_image,
     left_label,
+    left_thr_min,
+    left_thr_max,
+    left_kind,
     saved_feature=None,
     map_center=None,
     map_zoom=None,
-    right_image=None,
+    right_visual_image=None,
     right_label=None,
 ):
     try:
-        left_band = left_image.select(0)
-
-        palette = PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND
-        vis = {
-            "min": thr_min,
-            "max": thr_max,
-            "palette": palette,
-        }
-
         if map_center is None:
             map_center = CENTER
         if map_zoom is None:
@@ -465,7 +590,7 @@ def build_map(
 
         m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
 
-        left_map_id = left_band.getMapId(vis)
+        left_map_id = left_visual_image.getMapId({})
         left_tile_url = left_map_id["tile_fetcher"].url_format
 
         left_layer = folium.TileLayer(
@@ -477,9 +602,8 @@ def build_map(
         )
         left_layer.add_to(m)
 
-        if right_image is not None:
-            right_band = right_image.select(0)
-            right_map_id = right_band.getMapId(vis)
+        if right_visual_image is not None:
+            right_map_id = right_visual_image.getMapId({})
             right_tile_url = right_map_id["tile_fetcher"].url_format
 
             if right_label is None:
@@ -526,16 +650,16 @@ def build_map(
                 },
             ).add_to(m)
 
-        if kind == "anomaly":
+        if left_kind == "anomaly":
             num_classes = len(PALETTE_ANOM)
-            step = (thr_max - thr_min) / (num_classes - 1) if num_classes > 1 else 1
-            ticks = [thr_min + i * step for i in range(num_classes)]
+            step = (left_thr_max - left_thr_min) / (num_classes - 1) if num_classes > 1 else 1
+            ticks = [left_thr_min + i * step for i in range(num_classes)]
             colors = PALETTE_ANOM
             width = 260
         else:
             num_classes = len(PALETTE_INUND)
-            step = (thr_max - thr_min) / (num_classes - 1) if num_classes > 1 else 1
-            ticks = [thr_min + i * step for i in range(num_classes)]
+            step = (left_thr_max - left_thr_min) / (num_classes - 1) if num_classes > 1 else 1
+            ticks = [left_thr_min + i * step for i in range(num_classes)]
             colors = PALETTE_INUND
             width = 220
 
@@ -549,7 +673,7 @@ def build_map(
         legend_html = f"""
          <div style='position: fixed; bottom: 40px; left: 40px; width: {width}px;
              background-color: white; color: black; padding: 10px; border:2px solid grey; z-index:9999;'>
-         <b>{left_label} ({thr_min}–{thr_max})</b><br>
+         <b>{left_label} ({left_thr_min}–{left_thr_max})</b><br>
          {legend_rows}
          </div>
         """
@@ -692,9 +816,9 @@ def plot_pixelcount_timeseries(df, title):
 # ---------------------------------------------
 st.title("CYGNSS – Regional Viewer")
 st.caption(
-    "Explore CYGNSS inundation products (bands 1-5) from Google Earth Engine. "
-    "The map shows the mean of selected days for the chosen data type after applying thresholds. "
-    "Draw an area (rectangle) on the map to compute regional statistics and pixel counts."
+    "Compare left/right CYGNSS bands over independent date ranges and optional GEE overlays "
+    "(CHIRPS precipitation, NDVI, population). "
+    "Statistics are calculated only for the LEFT CYGNSS asset layer."
 )
 
 # ---------------------------------------------
@@ -712,148 +836,209 @@ if "map_zoom" not in st.session_state:
 if st.button("Clear selected region"):
     st.session_state.saved_feature = None
 
-
-# ---------------------------------------------
-# 0) DATA TYPE SELECTION
-# ---------------------------------------------
-mode_label = st.selectbox(
-    "Data type:",
-    list(DATA_MODES.keys()),
-    index=0,
-)
-mode_cfg = DATA_MODES[mode_label]
-kind = mode_cfg["kind"]
-band_index = mode_cfg["band_index"]
-
 split_view = st.checkbox(
     "Enable split-view map comparison (left vs right)",
-    value=False,
+    value=True,
 )
 
-# ---------------------------------------------
-# 1) DATE RANGE SELECTION
-# ---------------------------------------------
-st.markdown("### Select date range")
+left_col, right_col = st.columns(2)
 
-date_range = st.date_input(
-    "Date range (from–to):",
-    value=(MIN_DATE, MIN_DATE),
-    min_value=MIN_DATE,
-    max_value=MAX_DATE,
-    format="YYYY-MM-DD",
-)
+with left_col:
+    st.markdown("### LEFT panel")
+    left_band_number = st.selectbox(
+        "LEFT band:",
+        list(BAND_OPTIONS.keys()),
+        index=0,
+        format_func=lambda b: f"Band {b} – {BAND_OPTIONS[b]}",
+    )
 
-if isinstance(date_range, tuple):
-    if len(date_range) != 2 or date_range[0] is None or date_range[1] is None:
-        st.stop()
-    start_date, end_date = date_range
-else:
-    start_date = end_date = date_range
-
-if start_date > end_date:
-    start_date, end_date = end_date, start_date
-
-start_date = max(start_date, MIN_DATE)
-end_date = min(end_date, MAX_DATE)
-
-selected_dates = []
-current_date = start_date
-while current_date <= end_date:
-    selected_dates.append(current_date)
-    current_date += dt.timedelta(days=1)
-
-if not selected_dates:
-    st.stop()
-
-year_start = dt.date(YEAR, 1, 1)
-sel_days = [
-    (d - year_start).days + 1
-    for d in selected_dates
-    if START_DOY <= (d - year_start).days + 1 <= END_DOY
-]
-
-if not sel_days:
-    st.warning("No valid dataset days found in the selected range.")
-    st.stop()
-
-sel_days_tuple = tuple(sorted(sel_days))
-
-st.write("Dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in selected_dates))
-
-right_sel_days = None
-right_label = None
-
-if split_view:
-    compare_date = st.date_input(
-        "Comparison date for RIGHT side:",
-        value=selected_dates[-1],
+    left_date_range = st.date_input(
+        "LEFT date range (from–to):",
+        value=(MIN_DATE, MIN_DATE),
         min_value=MIN_DATE,
         max_value=MAX_DATE,
         format="YYYY-MM-DD",
+        key="left_date_range",
     )
 
-    compare_doy = (compare_date - dt.date(YEAR, 1, 1)).days + 1
-    if not (START_DOY <= compare_doy <= END_DOY):
-        st.warning("Comparison date is outside the available dataset range.")
-        st.stop()
+    left_add_chirps = st.checkbox("LEFT: add CHIRPS precipitation layer", value=False)
+    left_add_ndvi = st.checkbox("LEFT: add NDVI layer", value=False)
+    left_add_population = st.checkbox("LEFT: add population layer", value=False)
 
-    right_sel_days = [compare_doy]
-    right_label = f"{mode_label} | RIGHT: {compare_date.strftime('%Y-%m-%d')}"
+with right_col:
+    st.markdown("### RIGHT panel")
+    right_band_number = st.selectbox(
+        "RIGHT band:",
+        list(BAND_OPTIONS.keys()),
+        index=0,
+        format_func=lambda b: f"Band {b} – {BAND_OPTIONS[b]}",
+        disabled=not split_view,
+    )
 
-# ---------------------------------------------
-# 2) THRESHOLD SELECTION
-# ---------------------------------------------
-if kind == "anomaly":
-    thr_min, thr_max = st.slider(
-        "Anomaly range (lower and upper threshold):",
+    right_date_range = st.date_input(
+        "RIGHT date range (from–to):",
+        value=(MIN_DATE, MIN_DATE),
+        min_value=MIN_DATE,
+        max_value=MAX_DATE,
+        format="YYYY-MM-DD",
+        key="right_date_range",
+        disabled=not split_view,
+    )
+
+    right_add_chirps = st.checkbox(
+        "RIGHT: add CHIRPS precipitation layer", value=False, disabled=not split_view
+    )
+    right_add_ndvi = st.checkbox("RIGHT: add NDVI layer", value=False, disabled=not split_view)
+    right_add_population = st.checkbox(
+        "RIGHT: add population layer", value=False, disabled=not split_view
+    )
+
+left_start_date, left_end_date = parse_date_range(left_date_range)
+if left_start_date is None:
+    st.warning("Invalid LEFT date range.")
+    st.stop()
+
+left_selected_dates, left_sel_days = dates_to_doys(left_start_date, left_end_date)
+if not left_sel_days:
+    st.warning("No valid LEFT dataset days found in selected range.")
+    st.stop()
+
+left_kind = band_kind(left_band_number)
+left_band_index = left_band_number - 1
+left_label = (
+    f"LEFT | Band {left_band_number}: {BAND_OPTIONS[left_band_number]} | "
+    f"{left_start_date.strftime('%Y-%m-%d')}→{left_end_date.strftime('%Y-%m-%d')}"
+)
+
+if left_kind == "anomaly":
+    left_thr_min, left_thr_max = st.slider(
+        "LEFT threshold range:",
         min_value=-100,
         max_value=100,
         value=(-20, 20),
         step=1,
+        key="left_thr",
     )
 else:
-    thr_min, thr_max = st.slider(
-        f"Value range (lower and upper threshold, {mode_label}):",
+    left_thr_min, left_thr_max = st.slider(
+        "LEFT threshold range:",
         min_value=0,
         max_value=100,
         value=(20, 100),
         step=1,
+        key="left_thr",
     )
 
-if thr_min >= thr_max:
-    st.error("Lower threshold must be smaller than upper threshold.")
+if left_thr_min >= left_thr_max:
+    st.error("LEFT lower threshold must be smaller than upper threshold.")
     st.stop()
 
+if split_view:
+    right_start_date, right_end_date = parse_date_range(right_date_range)
+    if right_start_date is None:
+        st.warning("Invalid RIGHT date range.")
+        st.stop()
+
+    right_selected_dates, right_sel_days = dates_to_doys(right_start_date, right_end_date)
+    if not right_sel_days:
+        st.warning("No valid RIGHT dataset days found in selected range.")
+        st.stop()
+
+    right_kind = band_kind(right_band_number)
+    right_band_index = right_band_number - 1
+    right_label = (
+        f"RIGHT | Band {right_band_number}: {BAND_OPTIONS[right_band_number]} | "
+        f"{right_start_date.strftime('%Y-%m-%d')}→{right_end_date.strftime('%Y-%m-%d')}"
+    )
+
+    if right_kind == "anomaly":
+        right_thr_min, right_thr_max = st.slider(
+            "RIGHT threshold range:",
+            min_value=-100,
+            max_value=100,
+            value=(-20, 20),
+            step=1,
+            key="right_thr",
+        )
+    else:
+        right_thr_min, right_thr_max = st.slider(
+            "RIGHT threshold range:",
+            min_value=0,
+            max_value=100,
+            value=(20, 100),
+            step=1,
+            key="right_thr",
+        )
+
+    if right_thr_min >= right_thr_max:
+        st.error("RIGHT lower threshold must be smaller than upper threshold.")
+        st.stop()
+else:
+    right_sel_days = None
+    right_start_date = None
+    right_end_date = None
+    right_kind = None
+    right_band_index = None
+    right_thr_min = None
+    right_thr_max = None
+    right_label = None
+
+st.write("LEFT dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in left_selected_dates))
+if split_view and right_start_date is not None:
+    st.write("RIGHT dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in right_selected_dates))
+
 # ---------------------------------------------
-# BUILD MEAN IMAGE FOR MAP
+# BUILD IMAGES FOR MAP
 # ---------------------------------------------
 try:
-    mean_image = build_mean_image(sel_days, thr_min, thr_max, kind, band_index)
+    left_visual_image = build_side_visual_image(
+        selected_days=left_sel_days,
+        thr_min=left_thr_min,
+        thr_max=left_thr_max,
+        kind=left_kind,
+        band_index=left_band_index,
+        start_date=left_start_date,
+        end_date=left_end_date,
+        add_chirps=left_add_chirps,
+        add_ndvi=left_add_ndvi,
+        add_population=left_add_population,
+    )
 except Exception as e:
-    st.error(f"Failed to build mean image: {e}")
+    st.error(f"Failed to build LEFT image: {e}")
     st.stop()
 
-right_image = None
+right_visual_image = None
 if split_view and right_sel_days is not None:
     try:
-        right_image = build_mean_image(right_sel_days, thr_min, thr_max, kind, band_index)
+        right_visual_image = build_side_visual_image(
+            selected_days=right_sel_days,
+            thr_min=right_thr_min,
+            thr_max=right_thr_max,
+            kind=right_kind,
+            band_index=right_band_index,
+            start_date=right_start_date,
+            end_date=right_end_date,
+            add_chirps=right_add_chirps,
+            add_ndvi=right_add_ndvi,
+            add_population=right_add_population,
+        )
     except Exception as e:
-        st.error(f"Failed to build comparison image: {e}")
+        st.error(f"Failed to build RIGHT image: {e}")
         st.stop()
 
 # ---------------------------------------------
 # BUILD / DISPLAY MAP
 # ---------------------------------------------
 m = build_map(
-    left_image=mean_image,
-    thr_min=thr_min,
-    thr_max=thr_max,
-    kind=kind,
-    left_label=f"{mode_label} | LEFT: {start_date.strftime('%Y-%m-%d')}→{end_date.strftime('%Y-%m-%d')}",
+    left_visual_image=left_visual_image,
+    left_label=left_label,
+    left_thr_min=left_thr_min,
+    left_thr_max=left_thr_max,
+    left_kind=left_kind,
     saved_feature=st.session_state.saved_feature,
     map_center=st.session_state.map_center,
     map_zoom=st.session_state.map_zoom,
-    right_image=right_image,
+    right_visual_image=right_visual_image,
     right_label=right_label,
 )
 
@@ -882,11 +1067,12 @@ feature = st.session_state.saved_feature
 st.markdown("---")
 
 # ---------------------------------------------
-# STATS & COUNTS FOR SELECTED REGION
+# STATS & COUNTS FOR SELECTED REGION (LEFT ONLY)
 # ---------------------------------------------
-st.subheader("Statistics and pixel counts for the drawn area")
+st.subheader("Statistics and pixel counts for the drawn area (LEFT asset layer only)")
 
 user_min = user_max = user_mean = None
+left_sel_days_tuple = tuple(left_sel_days)
 
 if feature and "geometry" in feature:
     geom = feature["geometry"]
@@ -900,50 +1086,50 @@ if feature and "geometry" in feature:
         ymin, ymax = min(lats), max(lats)
 
         user_min, user_max, user_mean = compute_region_summary_for_bbox(
-            sel_days_tuple,
-            thr_min,
-            thr_max,
+            left_sel_days_tuple,
+            left_thr_min,
+            left_thr_max,
             xmin,
             ymin,
             xmax,
             ymax,
-            kind,
-            band_index,
+            left_kind,
+            left_band_index,
         )
 
         pixel_count_inrange, pixel_count_total = compute_region_pixel_count(
-            sel_days_tuple,
-            thr_min,
-            thr_max,
+            left_sel_days_tuple,
+            left_thr_min,
+            left_thr_max,
             xmin,
             ymin,
             xmax,
             ymax,
-            kind,
-            band_index,
+            left_kind,
+            left_band_index,
         )
 
         region_ts = compute_region_ts_for_bbox(
-            sel_days_tuple,
-            thr_min,
-            thr_max,
+            left_sel_days_tuple,
+            left_thr_min,
+            left_thr_max,
             xmin,
             ymin,
             xmax,
             ymax,
-            kind,
-            band_index,
+            left_kind,
+            left_band_index,
         )
 
         if any(v is None for v in (user_min, user_max, user_mean)) or pixel_count_total == 0:
             st.info(
                 "There are no valid pixels in the selected area "
-                "for the chosen thresholds/scale. Try a larger area or different thresholds."
+                "for the chosen LEFT thresholds/scale. Try a larger area or different thresholds."
             )
         else:
             c1, c2, c3, c4, c5 = st.columns(5)
 
-            if kind == "anomaly":
+            if left_kind == "anomaly":
                 c1.metric("Min anomaly (area)", f"{user_min:.4f}")
                 c2.metric("Max anomaly (area)", f"{user_max:.4f}")
                 c3.metric("Mean anomaly (area)", f"{user_mean:.4f}")
@@ -964,17 +1150,17 @@ if feature and "geometry" in feature:
 
                 with col_ts:
                     title_ts = (
-                        f"Min / Max / Mean anomaly time series (area, {mode_label})"
-                        if kind == "anomaly"
-                        else f"Min / Max / Mean time series (area, {mode_label})"
+                        f"Min / Max / Mean anomaly time series (LEFT area, band {left_band_number})"
+                        if left_kind == "anomaly"
+                        else f"Min / Max / Mean time series (LEFT area, band {left_band_number})"
                     )
-                    plot_timeseries(df_r, title_ts, kind, thr_max)
+                    plot_timeseries(df_r, title_ts, left_kind, left_thr_max)
 
                 with col_cnt:
-                    title_cnt = f"Daily pixel counts in area ({mode_label})"
+                    title_cnt = f"Daily pixel counts in LEFT area (band {left_band_number})"
                     plot_pixelcount_timeseries(df_r, title_cnt)
             else:
-                st.info("No data available to draw time series for the selected area (after masking).")
+                st.info("No data available to draw LEFT time series for the selected area (after masking).")
     else:
         st.info("Draw a rectangular area on the map using the drawing tool.")
 else:
