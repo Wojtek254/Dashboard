@@ -9,6 +9,7 @@ import ee
 import folium
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from folium.plugins import Draw, SideBySideLayers
 from google.oauth2 import service_account
 from PIL import Image, ImageDraw, ImageFont
@@ -888,6 +889,64 @@ def build_png_report(view_info, stats_info):
     return buf.getvalue()
 
 
+def render_fullpage_screenshot_button():
+    components.html(
+        """
+        <div style="padding:8px 0;">
+          <button id="capture_full_page_png"
+            style="background:#0b57d0;color:#fff;border:none;padding:10px 16px;border-radius:8px;cursor:pointer;font-weight:600;">
+            Download FULL page PNG (printscreen)
+          </button>
+          <span id="capture_status" style="margin-left:10px;font-family:sans-serif;font-size:12px;color:#333;"></span>
+        </div>
+        <script>
+          async function loadHtml2Canvas() {
+            if (window.html2canvas) return window.html2canvas;
+            return new Promise((resolve, reject) => {
+              const s = document.createElement("script");
+              s.src = "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js";
+              s.onload = () => resolve(window.html2canvas);
+              s.onerror = reject;
+              document.head.appendChild(s);
+            });
+          }
+
+          async function capture() {
+            const status = document.getElementById("capture_status");
+            try {
+              status.textContent = "Preparing screenshot...";
+              const h2c = await loadHtml2Canvas();
+              const target = window.parent.document.body;
+              const scale = Math.max(2, window.parent.devicePixelRatio || 2);
+              const canvas = await h2c(target, {
+                useCORS: true,
+                allowTaint: true,
+                backgroundColor: "#ffffff",
+                scale: scale,
+                windowWidth: target.scrollWidth,
+                windowHeight: target.scrollHeight,
+                width: target.scrollWidth,
+                height: target.scrollHeight,
+                scrollX: 0,
+                scrollY: 0
+              });
+              const a = document.createElement("a");
+              a.download = "dashboard_fullpage_screenshot.png";
+              a.href = canvas.toDataURL("image/png");
+              a.click();
+              status.textContent = "PNG downloaded.";
+            } catch (e) {
+              status.textContent = "Screenshot failed (browser CORS/security).";
+            }
+          }
+
+          document.getElementById("capture_full_page_png").addEventListener("click", capture);
+        </script>
+        """,
+        height=80,
+    )
+
+
 # ---------------------------------------------
 # APP HEADER
 # ---------------------------------------------
@@ -1249,6 +1308,9 @@ else:
 
 st.markdown("---")
 st.subheader("Export PNG")
+st.caption("Use full-page screenshot first (captures map + charts + stats). If browser blocks it, use fallback report PNG.")
+
+render_fullpage_screenshot_button()
 
 view_info = {
     "left_label": left_label,
@@ -1276,7 +1338,7 @@ stats_info = {
 
 png_bytes = build_png_report(view_info=view_info, stats_info=stats_info)
 st.download_button(
-    label="Download current view/statistics as PNG",
+    label="Fallback: Download report PNG (metadata + stats)",
     data=png_bytes,
     file_name=f"cygnss_snapshot_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png",
     mime="image/png",
