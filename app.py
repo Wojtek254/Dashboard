@@ -95,6 +95,14 @@ CONTOUR_LAYER_OPTIONS = {
     "elevation": "Elevation / depth above sea level",
 }
 
+SECONDARY_SHADING_OPTIONS = {
+    **{f"cygnss_{band_number}": label for band_number, label in BAND_OPTIONS.items()},
+    "chirps": "CHIRPS precipitation",
+    "ndvi": "NDVI",
+    "population": "Population",
+    "elevation": "Elevation / depth above sea level",
+}
+
 CONTOUR_CONFIG = {
     "chirps": {
         "band": "precipitation",
@@ -133,6 +141,14 @@ CONTOUR_CONFIG = {
 
 def band_kind(band_number: int) -> str:
     return "anomaly" if band_number in (4, 5) else "inundation"
+
+
+def is_cygnss_layer(layer_key: str) -> bool:
+    return layer_key.startswith("cygnss_")
+
+
+def cygnss_band_number(layer_key: str) -> int:
+    return int(layer_key.split("_", 1)[1])
 
 
 # ---------------------------------------------
@@ -335,84 +351,110 @@ def build_contour_image(source_image, contour_layer):
     return contour_mask.visualize(palette=[cfg["color"]], opacity=0.85)
 
 
-def build_side_visual_image(
+def build_shading_image(
+    shading_layer,
     selected_days,
-    thr_min,
-    thr_max,
-    kind,
-    band_index,
     start_date,
     end_date,
-    contour_layer,
-):
-    mean_image = build_mean_image(selected_days, thr_min, thr_max, kind, band_index)
-    palette = PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND
-
-    shading_rgb = mean_image.select(0).visualize(
-        min=thr_min,
-        max=thr_max,
-        palette=palette,
-    )
-
-    layers = [("shading", shading_rgb)]
-
-    if contour_layer != "none":
-        contour_source = get_contour_source_image(contour_layer, start_date, end_date)
-        layers.append(("contour", build_contour_image(contour_source, contour_layer)))
-
-    return layers
-
-
-def make_side_map_entries(
-    visual_layers,
-    panel_name,
-    side_key,
-    band_number,
-    kind,
-    start_date,
-    end_date,
-    thr_min,
-    thr_max,
-    contour_layer,
+    cygnss_thr_min=None,
+    cygnss_thr_max=None,
 ):
     date_label = layer_date_label(start_date, end_date)
-    cygnss_palette = PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND
-    cygnss_range = f"{thr_min}-{thr_max}"
-    cygnss_name = BAND_OPTIONS[band_number]
 
-    map_entries = [
+    if is_cygnss_layer(shading_layer):
+        band_number = cygnss_band_number(shading_layer)
+        kind = band_kind(band_number)
+        band_index = band_number - 1
+        palette = PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND
+        source_image = build_mean_image(
+            selected_days=selected_days,
+            thr_min=cygnss_thr_min,
+            thr_max=cygnss_thr_max,
+            kind=kind,
+            band_index=band_index,
+        ).select(0)
+        return source_image.visualize(
+            min=cygnss_thr_min,
+            max=cygnss_thr_max,
+            palette=palette,
+        ), {
+            "short_label": BAND_OPTIONS[band_number],
+            "palette": palette,
+            "vmin": cygnss_thr_min,
+            "vmax": cygnss_thr_max,
+            "date_label": date_label,
+            "range_label": f"{cygnss_thr_min}-{cygnss_thr_max}",
+        }
+
+    cfg = CONTOUR_CONFIG[shading_layer]
+    source_image = get_contour_source_image(shading_layer, start_date, end_date)
+    return source_image.visualize(
+        min=cfg["min"],
+        max=cfg["max"],
+        palette=cfg["palette"],
+    ), {
+        "short_label": CONTOUR_LAYER_OPTIONS[shading_layer],
+        "palette": cfg["palette"],
+        "vmin": cfg["min"],
+        "vmax": cfg["max"],
+        "date_label": date_label,
+        "range_label": cfg["range_label"],
+    }
+
+
+def build_panel_map_layers(
+    panel_name,
+    shading_layer,
+    selected_days,
+    start_date,
+    end_date,
+    contour_layer="none",
+    cygnss_thr_min=None,
+    cygnss_thr_max=None,
+):
+    shading_image, shading_meta = build_shading_image(
+        shading_layer=shading_layer,
+        selected_days=selected_days,
+        start_date=start_date,
+        end_date=end_date,
+        cygnss_thr_min=cygnss_thr_min,
+        cygnss_thr_max=cygnss_thr_max,
+    )
+
+    composite_image = shading_image
+    hover_entries = [
         {
-            "image": visual_layers[0][1],
-            "label": make_cygnss_label(panel_name, band_number, start_date, end_date, thr_min, thr_max),
             "panel": panel_name,
             "type": "shading",
-            "short_label": cygnss_name,
-            "date_label": date_label,
-            "range_label": cygnss_range,
+            "short_label": shading_meta["short_label"],
+            "date_label": shading_meta["date_label"],
+            "range_label": shading_meta["range_label"],
         }
     ]
     legend_entries = [
         {
-            "title": f"{panel_name} shading: {cygnss_name}",
-            "palette": cygnss_palette,
-            "vmin": thr_min,
-            "vmax": thr_max,
-            "date_label": date_label,
-            "range_label": cygnss_range,
+            "title": f"{panel_name} shading: {shading_meta['short_label']}",
+            "palette": shading_meta["palette"],
+            "vmin": shading_meta["vmin"],
+            "vmax": shading_meta["vmax"],
+            "date_label": shading_meta["date_label"],
+            "range_label": shading_meta["range_label"],
         }
     ]
 
-    if contour_layer != "none" and len(visual_layers) > 1:
+    label_parts = [f"shading: {shading_meta['short_label']}"]
+    if contour_layer != "none":
         cfg = CONTOUR_CONFIG[contour_layer]
+        contour_source = get_contour_source_image(contour_layer, start_date, end_date)
+        contour_image = build_contour_image(contour_source, contour_layer)
         contour_name = CONTOUR_LAYER_OPTIONS[contour_layer]
-        map_entries.append(
+        composite_image = composite_image.blend(contour_image)
+        hover_entries.append(
             {
-                "image": visual_layers[1][1],
-                "label": f"{panel_name} | contour: {contour_name} | {date_label} | range {cfg['range_label']}",
                 "panel": panel_name,
                 "type": "contour",
                 "short_label": contour_name,
-                "date_label": date_label,
+                "date_label": shading_meta["date_label"],
                 "range_label": cfg["range_label"],
             }
         )
@@ -422,12 +464,17 @@ def make_side_map_entries(
                 "palette": cfg["palette"],
                 "vmin": cfg["min"],
                 "vmax": cfg["max"],
-                "date_label": date_label,
+                "date_label": shading_meta["date_label"],
                 "range_label": cfg["range_label"],
             }
         )
+        label_parts.append(f"contour: {contour_name}")
 
-    return map_entries, legend_entries
+    tile_entry = {
+        "image": composite_image,
+        "label": f"{panel_name} | {' | '.join(label_parts)} | {shading_meta['date_label']}",
+    }
+    return tile_entry, hover_entries, legend_entries
 
 
 # ---------------------------------------------
@@ -673,13 +720,6 @@ def layer_date_label(start_date, end_date):
     return f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
 
 
-def make_cygnss_label(panel_name, band_number, start_date, end_date, thr_min, thr_max):
-    return (
-        f"{panel_name} | {BAND_OPTIONS[band_number]} | "
-        f"{layer_date_label(start_date, end_date)} | range {thr_min}-{thr_max}"
-    )
-
-
 def make_legend_html(title, palette, vmin, vmax, date_label, range_label, bottom, side):
     gradient = ", ".join(palette)
     align = "left" if side == "left" else "right"
@@ -698,20 +738,18 @@ def make_legend_html(title, palette, vmin, vmax, date_label, range_label, bottom
     """
 
 
-def add_layer_group(m, group_name, layer_entries):
-    group = folium.FeatureGroup(name=group_name, overlay=True, control=True)
-    for entry in layer_entries:
-        map_id = entry["image"].getMapId({})
-        tile_url = map_id["tile_fetcher"].url_format
-        folium.TileLayer(
-            tiles=tile_url,
-            attr="Google Earth Engine",
-            name=entry["label"],
-            overlay=True,
-            control=True,
-        ).add_to(group)
-    group.add_to(m)
-    return group
+def add_tile_layer(m, entry):
+    map_id = entry["image"].getMapId({})
+    tile_url = map_id["tile_fetcher"].url_format
+    layer = folium.TileLayer(
+        tiles=tile_url,
+        attr="Google Earth Engine",
+        name=entry["label"],
+        overlay=True,
+        control=True,
+    )
+    layer.add_to(m)
+    return layer
 
 
 def add_mouse_value_hint(m, layer_entries):
@@ -720,8 +758,7 @@ def add_mouse_value_hint(m, layer_entries):
         f"date {entry['date_label']}; range {entry['range_label']}</div>"
         for entry in layer_entries
     )
-    tooltip_html = f"""
-    <script>
+    tooltip_js = f"""
     (function() {{
       setTimeout(function() {{
         var map = {m.get_name()};
@@ -748,18 +785,19 @@ def add_mouse_value_hint(m, layer_entries):
         }});
       }}, 0);
     }})();
-    </script>
     """
-    m.get_root().html.add_child(folium.Element(tooltip_html))
+    m.get_root().script.add_child(folium.Element(tooltip_js))
 
 
 def build_map(
-    left_layers,
+    left_tile_entry,
+    left_hover_entries,
     left_legend_entries,
     saved_feature=None,
     map_center=None,
     map_zoom=None,
-    right_layers=None,
+    right_tile_entry=None,
+    right_hover_entries=None,
     right_legend_entries=None,
 ):
     try:
@@ -770,10 +808,10 @@ def build_map(
 
         m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
 
-        left_layer = add_layer_group(m, "MAIN (left)", left_layers)
+        left_layer = add_tile_layer(m, left_tile_entry)
 
-        if right_layers:
-            right_layer = add_layer_group(m, "SECONDARY (right)", right_layers)
+        if right_tile_entry:
+            right_layer = add_tile_layer(m, right_tile_entry)
             SideBySideLayers(left_layer, right_layer).add_to(m)
 
         Draw(
@@ -817,7 +855,7 @@ def build_map(
             )
 
         MousePosition(position="bottomleft", separator=", ", prefix="Lat/Lon:").add_to(m)
-        add_mouse_value_hint(m, left_layers + (right_layers or []))
+        add_mouse_value_hint(m, left_hover_entries + (right_hover_entries or []))
         folium.LayerControl().add_to(m)
         return m
 
@@ -1154,11 +1192,11 @@ with left_col:
 
 with right_col:
     st.markdown("### SECONDARY (right)")
-    right_band_number = st.selectbox(
-        "SECONDARY data:",
-        list(BAND_OPTIONS.keys()),
+    right_shading_layer = st.selectbox(
+        "SECONDARY shading layer:",
+        list(SECONDARY_SHADING_OPTIONS.keys()),
         index=0,
-        format_func=lambda b: BAND_OPTIONS[b],
+        format_func=lambda key: SECONDARY_SHADING_OPTIONS[key],
         disabled=not split_view,
     )
 
@@ -1231,35 +1269,44 @@ if split_view:
         st.warning("No valid SECONDARY dataset days found in selected range.")
         st.stop()
 
-    right_kind = band_kind(right_band_number)
-    right_band_index = right_band_number - 1
     right_label = (
-        f"SECONDARY (right) | {BAND_OPTIONS[right_band_number]} | "
+        f"SECONDARY (right) | {SECONDARY_SHADING_OPTIONS[right_shading_layer]} | "
         f"{right_start_date.strftime('%Y-%m-%d')} to {right_end_date.strftime('%Y-%m-%d')}"
     )
 
-    if right_kind == "anomaly":
-        right_thr_min, right_thr_max = st.slider(
-            "SECONDARY threshold range:",
-            min_value=-100,
-            max_value=100,
-            value=(-100, 100),
-            step=1,
-            key="right_thr",
-        )
-    else:
-        right_thr_min, right_thr_max = st.slider(
-            "SECONDARY threshold range:",
-            min_value=0,
-            max_value=100,
-            value=(0, 100),
-            step=1,
-            key="right_thr",
-        )
+    if is_cygnss_layer(right_shading_layer):
+        right_band_number = cygnss_band_number(right_shading_layer)
+        right_kind = band_kind(right_band_number)
+        right_band_index = right_band_number - 1
 
-    if right_thr_min >= right_thr_max:
-        st.error("SECONDARY lower threshold must be smaller than upper threshold.")
-        st.stop()
+        if right_kind == "anomaly":
+            right_thr_min, right_thr_max = st.slider(
+                "SECONDARY CYGNSS threshold range:",
+                min_value=-100,
+                max_value=100,
+                value=(-100, 100),
+                step=1,
+                key="right_thr",
+            )
+        else:
+            right_thr_min, right_thr_max = st.slider(
+                "SECONDARY CYGNSS threshold range:",
+                min_value=0,
+                max_value=100,
+                value=(0, 100),
+                step=1,
+                key="right_thr",
+            )
+
+        if right_thr_min >= right_thr_max:
+            st.error("SECONDARY lower threshold must be smaller than upper threshold.")
+            st.stop()
+    else:
+        right_band_number = None
+        right_kind = None
+        right_band_index = None
+        right_thr_min = None
+        right_thr_max = None
 else:
     right_sel_days = None
     right_start_date = None
@@ -1269,6 +1316,7 @@ else:
     right_thr_min = None
     right_thr_max = None
     right_label = None
+    right_shading_layer = None
     right_contour_layer = "none"
 
 st.write("MAIN dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in left_selected_dates))
@@ -1279,57 +1327,34 @@ if split_view and right_start_date is not None:
 # BUILD IMAGES FOR MAP
 # ---------------------------------------------
 try:
-    left_visual_layers = build_side_visual_image(
-        selected_days=left_sel_days,
-        thr_min=left_thr_min,
-        thr_max=left_thr_max,
-        kind=left_kind,
-        band_index=left_band_index,
-        start_date=left_start_date,
-        end_date=left_end_date,
-        contour_layer=left_contour_layer,
-    )
-    left_map_layers, left_legend_entries = make_side_map_entries(
-        visual_layers=left_visual_layers,
+    left_tile_entry, left_hover_entries, left_legend_entries = build_panel_map_layers(
         panel_name="MAIN (left)",
-        side_key="left",
-        band_number=left_band_number,
-        kind=left_kind,
+        shading_layer=f"cygnss_{left_band_number}",
+        selected_days=left_sel_days,
         start_date=left_start_date,
         end_date=left_end_date,
-        thr_min=left_thr_min,
-        thr_max=left_thr_max,
         contour_layer=left_contour_layer,
+        cygnss_thr_min=left_thr_min,
+        cygnss_thr_max=left_thr_max,
     )
 except Exception as e:
     st.error(f"Failed to build MAIN image: {e}")
     st.stop()
 
-right_map_layers = None
+right_tile_entry = None
+right_hover_entries = None
 right_legend_entries = None
 if split_view and right_sel_days is not None:
     try:
-        right_visual_layers = build_side_visual_image(
-            selected_days=right_sel_days,
-            thr_min=right_thr_min,
-            thr_max=right_thr_max,
-            kind=right_kind,
-            band_index=right_band_index,
-            start_date=right_start_date,
-            end_date=right_end_date,
-            contour_layer=right_contour_layer,
-        )
-        right_map_layers, right_legend_entries = make_side_map_entries(
-            visual_layers=right_visual_layers,
+        right_tile_entry, right_hover_entries, right_legend_entries = build_panel_map_layers(
             panel_name="SECONDARY (right)",
-            side_key="right",
-            band_number=right_band_number,
-            kind=right_kind,
+            shading_layer=right_shading_layer,
+            selected_days=right_sel_days,
             start_date=right_start_date,
             end_date=right_end_date,
-            thr_min=right_thr_min,
-            thr_max=right_thr_max,
             contour_layer=right_contour_layer,
+            cygnss_thr_min=right_thr_min,
+            cygnss_thr_max=right_thr_max,
         )
     except Exception as e:
         st.error(f"Failed to build SECONDARY image: {e}")
@@ -1339,12 +1364,14 @@ if split_view and right_sel_days is not None:
 # BUILD / DISPLAY MAP
 # ---------------------------------------------
 m = build_map(
-    left_layers=left_map_layers,
+    left_tile_entry=left_tile_entry,
+    left_hover_entries=left_hover_entries,
     left_legend_entries=left_legend_entries,
     saved_feature=st.session_state.saved_feature,
     map_center=st.session_state.map_center,
     map_zoom=st.session_state.map_zoom,
-    right_layers=right_map_layers,
+    right_tile_entry=right_tile_entry,
+    right_hover_entries=right_hover_entries,
     right_legend_entries=right_legend_entries,
 )
 
