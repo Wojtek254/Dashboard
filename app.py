@@ -615,6 +615,32 @@ def extract_feature_from_map_state(map_state):
                 feature = drawings[-1]
     return feature
 
+OVERLAY_LEGENDS = {
+    "chirps": {
+        "title": "CHIRPS precipitation",
+        "palette": ["#f7fbff", "#6baed6", "#2171b5", "#08306b"],
+        "min": 0,
+        "max": 20,
+    },
+    "ndvi": {
+        "title": "NDVI",
+        "palette": ["#f7fcf5", "#a1d99b", "#31a354", "#006d2c"],
+        "min": 0.0,
+        "max": 0.8,
+    },
+    "population": {
+        "title": "Population",
+        "palette": ["#ffffcc", "#ffeda0", "#feb24c", "#f03b20", "#bd0026"],
+        "min": 0,
+        "max": 1000,
+    },
+    "elevation": {
+        "title": "Elevation (m a.s.l.)",
+        "palette": ["#f7fcf5", "#c7e9c0", "#74c476", "#238b45", "#00441b"],
+        "min": 0,
+        "max": 3000,
+    },
+}
 
 def build_map(
     left_visual_image,
@@ -696,41 +722,112 @@ def build_map(
                 },
             ).add_to(m)
 
+        # ---------------------------------
+        # MAIN CYGNSS colorbar
+        # ---------------------------------
+        
         if left_kind == "anomaly":
-            num_classes = len(PALETTE_ANOM)
-            step = (left_thr_max - left_thr_min) / (num_classes - 1) if num_classes > 1 else 1
-            ticks = [left_thr_min + i * step for i in range(num_classes)]
-            colors = PALETTE_ANOM
-            width = 260
+            main_palette = PALETTE_ANOM
         else:
-            num_classes = len(PALETTE_INUND)
-            step = (left_thr_max - left_thr_min) / (num_classes - 1) if num_classes > 1 else 1
-            ticks = [left_thr_min + i * step for i in range(num_classes)]
-            colors = PALETTE_INUND
-            width = 220
-
-        legend_rows = ""
-        for val, col in zip(ticks, colors):
-            legend_rows += (
-                f"<i style='background:{col}; width:18px; height:10px; "
-                f"float:left; margin-right:4px;'></i> {val:.1f}<br>"
+            main_palette = PALETTE_INUND
+        
+        add_colorbar(
+            m,
+            title=f"MAIN CYGNSS ({left_thr_min} → {left_thr_max})",
+            palette=main_palette,
+            vmin=left_thr_min,
+            vmax=left_thr_max,
+            position="left",
+            bottom="40px",
+        )
+        
+        # ---------------------------------
+        # MAIN shading overlay colorbar
+        # ---------------------------------
+        
+        if left_shading_layer != "none":
+            cfg = OVERLAY_LEGENDS[left_shading_layer]
+        
+            add_colorbar(
+                m,
+                title=f"MAIN overlay: {cfg['title']}",
+                palette=cfg["palette"],
+                vmin=cfg["min"],
+                vmax=cfg["max"],
+                position="left",
+                bottom="260px",
             )
-
-        legend_html = f"""
-         <div style='position: fixed; bottom: 40px; left: 40px; width: {width}px;
-             background-color: white; color: black; padding: 10px; border:2px solid grey; z-index:9999;'>
-         <b>{left_label} ({left_thr_min}–{left_thr_max})</b><br>
-         {legend_rows}
-         </div>
-        """
-        m.get_root().html.add_child(folium.Element(legend_html))
-
+        
+        # ---------------------------------
+        # SECONDARY shading overlay colorbar
+        # ---------------------------------
+        
+        if (
+            right_shading_layer is not None
+            and right_shading_layer != "none"
+        ):
+            cfg = OVERLAY_LEGENDS[right_shading_layer]
+        
+            add_colorbar(
+                m,
+                title=f"SECONDARY overlay: {cfg['title']}",
+                palette=cfg["palette"],
+                vmin=cfg["min"],
+                vmax=cfg["max"],
+                position="right",
+                bottom="40px",
+            )
         folium.LayerControl().add_to(m)
         return m
 
     except Exception as e:
         st.error(f"Earth Engine map rendering failed: {e}")
         st.stop()
+
+def add_colorbar(
+    m,
+    title,
+    palette,
+    vmin,
+    vmax,
+    position="left",
+    bottom="40px",
+):
+    n = len(palette)
+
+    labels = [
+        vmin + (vmax - vmin) * i / (n - 1)
+        for i in range(n)
+    ]
+
+    rows = ""
+    for val, col in zip(labels, palette):
+        rows += (
+            f"<i style='background:{col}; width:18px; height:10px; "
+            f"float:left; margin-right:4px;'></i> {val:.1f}<br>"
+        )
+
+    side = "left:40px;" if position == "left" else "right:40px;"
+
+    html = f"""
+    <div style='
+        position: fixed;
+        bottom: {bottom};
+        {side}
+        width: 240px;
+        background-color: white;
+        color: black;
+        padding: 10px;
+        border: 2px solid grey;
+        z-index: 9999;
+        font-size: 13px;
+    '>
+    <b>{title}</b><br>
+    {rows}
+    </div>
+    """
+
+    m.get_root().html.add_child(folium.Element(html))
 
 
 # ---------------------------------------------
