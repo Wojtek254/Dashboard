@@ -817,6 +817,128 @@ def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, position, bot
         bottom=bottom,
     )
 
+def is_cygnss_layer(layer_name):
+    return isinstance(layer_name, str) and layer_name.startswith("cygnss_")
+
+
+def cygnss_band_number(layer_name):
+    return int(layer_name.split("_")[1])
+
+
+def layer_unit(layer_name):
+    if is_cygnss_layer(layer_name):
+        band = cygnss_band_number(layer_name)
+        return "pp" if band in (4, 5) else "%"
+
+    units = {
+        "chirps": "mm",
+        "ndvi": "-",
+        "population_density": "people/km²",
+        "elevation": "m a.s.l.",
+    }
+    return units.get(layer_name, "")
+
+
+def build_raw_layer_image(
+    layer_name,
+    start_date,
+    end_date,
+    selected_days=None,
+    thr_min=None,
+    thr_max=None,
+):
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_exclusive = (end_date + dt.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if layer_name == "none":
+        return None
+
+    if is_cygnss_layer(layer_name):
+        band_number = cygnss_band_number(layer_name)
+        band_index = band_number - 1
+        kind = band_kind(band_number)
+
+        img = build_mean_image(
+            selected_days=selected_days,
+            thr_min=thr_min,
+            thr_max=thr_max,
+            kind=kind,
+            band_index=band_index,
+        )
+
+        return img.rename("value")
+
+    if layer_name == "chirps":
+        return (
+            ee.ImageCollection(CHIRPS_COLLECTION)
+            .filterDate(start_str, end_exclusive)
+            .select("precipitation")
+            .sum()
+            .rename("value")
+        )
+
+    if layer_name == "ndvi":
+        return (
+            ee.ImageCollection(NDVI_COLLECTION)
+            .filterDate(start_str, end_exclusive)
+            .select("NDVI")
+            .mean()
+            .multiply(0.0001)
+            .rename("value")
+        )
+
+    if layer_name == "population_density":
+        return (
+            ee.ImageCollection(POP_COLLECTION)
+            .sort("system:time_start", False)
+            .first()
+            .select("population_density")
+            .rename("value")
+        )
+
+    if layer_name == "elevation":
+        return ee.Image(ELEVATION_IMAGE).select("elevation").rename("value")
+
+    return None
+
+
+def sample_layer_at_point(
+    layer_name,
+    lon,
+    lat,
+    start_date,
+    end_date,
+    selected_days=None,
+    thr_min=None,
+    thr_max=None,
+    scale=3000,
+):
+    if layer_name == "none":
+        return None
+
+    img = build_raw_layer_image(
+        layer_name=layer_name,
+        start_date=start_date,
+        end_date=end_date,
+        selected_days=selected_days,
+        thr_min=thr_min,
+        thr_max=thr_max,
+    )
+
+    if img is None:
+        return None
+
+    point = ee.Geometry.Point([lon, lat])
+
+    result = img.reduceRegion(
+        reducer=ee.Reducer.first(),
+        geometry=point,
+        scale=scale,
+        maxPixels=1e13,
+    ).getInfo()
+
+    value = result.get("value") if result else None
+    return value
 
 def build_map(
     left_visual_image,
@@ -1461,6 +1583,100 @@ map_state = st_folium(
     width=None,
     key="cygnss_map",
 )
+
+clicked = map_state.get("last_clicked") if map_state else None
+
+if clicked:
+    lat = clicked["lat"]
+    lon = clicked["lng"]
+
+    if split_view:
+        map_center_lon = st.session_state.map_center[1]
+        side = "MAIN" if lon < map_center_lon else "SECONDARY"
+    else:
+        side = "MAIN"
+
+    if side == "MAIN":
+        shading_layer = left_shading_layer
+        contour_layer = left_contour_layer
+        start_date = left_start_date
+        end_date = left_end_date
+        selected_days = left_sel_days
+        thr_min = left_thr_min
+        thr_max = left_thr_max
+    else:
+        shading_layer = right_shading_layer
+        contour_layer = right_contour_layer
+        start_date = right_start_date
+        end_date = right_end_date
+        selected_days = right_sel_days
+        thr_min = right_thr_min
+        thr_max = right_thr_max
+
+    try:
+        shading_value = sample_layer_at_point(
+            layer_name=shading_layer,
+            lon=lon,
+            lat=lat,
+            start_date=start_date,
+            end_date=end_date,
+            selected_days=selected_days,
+            thr_min=thr_min,
+            thr_max=thr_max,
+        )
+
+        contour_value = sample_layer_at_point(
+            layer_name=contour_layer,
+            lon=lon,
+            lat=lat,
+            start_date=start_date,
+            end_date=end_date,
+            selected_days=selected_days,
+            thr_min=thr_min,
+            thr_max=thr_max,
+        )
+
+        st.markdown("### Point inspection")
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric("Side", side)
+        c2.metric("Latitude", f"{lat:.5f}")
+        c3.metric("Longitude", f"{lon:.5f}")
+
+        rows = []
+
+        if shading_layer != "none":
+            rows.append(
+                {
+                    "type": "shading",
+                    "layer": LAYER_OPTIONS[shading_layer],
+                    "value": shading_value,
+                    "unit": layer_unit(shading_layer),
+                }
+            )
+
+        if contour_layer != "none":
+            rows.append(
+                {
+                    "type": "contour",
+                    "layer": LAYER_OPTIONS[contour_layer],
+                    "value": contour_value,
+                    "unit": layer_unit(contour_layer),
+                }
+            )
+
+        if rows:
+            df_point = pd.DataFrame(rows)
+            df_point["value"] = df_point["value"].apply(
+                lambda v: "No data" if v is None else f"{float(v):.4f}"
+            )
+            st.dataframe(df_point, use_container_width=True, hide_index=True)
+        else:
+            st.info("No layer selected on this side.")
+
+    except Exception as e:
+        st.error(f"Point inspection failed: {e}")
 
 if map_state is not None:
     if map_state.get("center") is not None:
