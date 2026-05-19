@@ -84,45 +84,52 @@ BAND_OPTIONS = {
 
 CHIRPS_COLLECTION = "UCSB-CHG/CHIRPS/DAILY"
 NDVI_COLLECTION = "MODIS/061/MOD13Q1"
-POP_COLLECTION = "CIESIN/GPWv411/GPW_Population_Count"
+POP_COLLECTION = "CIESIN/GPWv411/GPW_Population_Density"
 ELEVATION_IMAGE = "USGS/SRTMGL1_003"
 
-OVERLAY_OPTIONS = {
+LAYER_OPTIONS = {
     "none": "None",
+    "cygnss_1": "CYGNSS – Daily observations",
+    "cygnss_2": "CYGNSS – 3-daily interpolated data",
+    "cygnss_3": "CYGNSS – Interpolation flux",
+    "cygnss_4": "CYGNSS – 1-day inundation anomalies",
+    "cygnss_5": "CYGNSS – Interpolated inundation anomalies",
     "chirps": "CHIRPS precipitation",
     "ndvi": "NDVI",
-    "population": "Population",
+    "population_density": "Population density",
     "elevation": "Elevation a.s.l.",
 }
 
 OVERLAY_LEGENDS = {
     "chirps": {
-        "title": "CHIRPS precipitation (mm)",
+        "title": "CHIRPS precipitation",
         "palette": ["#f7fbff", "#6baed6", "#2171b5", "#08306b"],
         "min": 0,
         "max": 20,
+        "unit": "mm",
     },
     "ndvi": {
         "title": "NDVI",
         "palette": ["#f7fcf5", "#a1d99b", "#31a354", "#006d2c"],
         "min": 0.0,
         "max": 0.8,
+        "unit": "-",
     },
-    "population": {
-        "title": "Population count",
+    "population_density": {
+        "title": "Population density",
         "palette": ["#ffffcc", "#ffeda0", "#feb24c", "#f03b20", "#bd0026"],
         "min": 0,
         "max": 1000,
+        "unit": "people/km²",
     },
     "elevation": {
-        "title": "Elevation (m a.s.l.)",
+        "title": "Elevation",
         "palette": ["#f7fcf5", "#c7e9c0", "#74c476", "#238b45", "#00441b"],
         "min": 0,
         "max": 3000,
+        "unit": "m a.s.l.",
     },
 }
-
-
 def band_kind(band_number: int) -> str:
     return "anomaly" if band_number in (4, 5) else "inundation"
 
@@ -284,19 +291,57 @@ def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
     return pixel_mean
 
 
+def is_cygnss_layer(layer_name: str) -> bool:
+    return isinstance(layer_name, str) and layer_name.startswith("cygnss_")
+
+
+def cygnss_band_number(layer_name: str) -> int:
+    return int(layer_name.split("_")[1])
+
+
+def cygnss_layer_kind(layer_name: str) -> str:
+    return band_kind(cygnss_band_number(layer_name))
+
+
+def cygnss_layer_label(layer_name: str) -> str:
+    return BAND_OPTIONS[cygnss_band_number(layer_name)]
+
+
+def cygnss_unit(kind: str) -> str:
+    # For bands 1–3: inundation percentage. For bands 4–5: anomaly in percentage points.
+    return "pp" if kind == "anomaly" else "%"
+
+
+def cygnss_legend(layer_name, thr_min, thr_max):
+    kind = cygnss_layer_kind(layer_name)
+    return {
+        "title": f"CYGNSS – {cygnss_layer_label(layer_name)}",
+        "palette": PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND,
+        "min": thr_min,
+        "max": thr_max,
+        "unit": cygnss_unit(kind),
+    }
+
+
+def get_layer_legend(layer_name, thr_min=None, thr_max=None):
+    if layer_name == "none":
+        return None
+    if is_cygnss_layer(layer_name):
+        return cygnss_legend(layer_name, thr_min, thr_max)
+    return OVERLAY_LEGENDS[layer_name]
+
+
 def build_contours(img, vis, n_levels=10):
     """
-    Build true contour/isoline overlay from an Earth Engine image.
-
-    Each contour level gets a color from the layer palette, so the contour
-    colors represent the same value scale as the shaded layer.
+    Build simple value-based contour lines. Each contour level gets a color
+    sampled from the same palette as the shading layer.
     """
     vmin = float(vis["min"])
     vmax = float(vis["max"])
     palette = vis["palette"]
 
     if vmax <= vmin:
-        return None
+        vmax = vmin + 1
 
     step = (vmax - vmin) / n_levels
     contour_imgs = []
@@ -322,10 +367,28 @@ def build_contours(img, vis, n_levels=10):
     return ee.ImageCollection(contour_imgs).mosaic()
 
 
-def build_overlay_image(layer_name, start_date, end_date, mode="shading"):
-    """
-    Build optional overlay image.
+def build_cygnss_image(layer_name, selected_days, thr_min, thr_max, mode="shading"):
+    band_number = cygnss_band_number(layer_name)
+    kind = band_kind(band_number)
+    band_index = band_number - 1
 
+    img = build_mean_image(selected_days, thr_min, thr_max, kind, band_index)
+    vis = cygnss_legend(layer_name, thr_min, thr_max)
+
+    if mode == "contour":
+        return build_contours(img, vis)
+
+    return img.select(0).visualize(
+        min=vis["min"],
+        max=vis["max"],
+        palette=vis["palette"],
+        opacity=0.75,
+    )
+
+
+def build_external_layer_image(layer_name, start_date, end_date, mode="shading"):
+    """
+    Build non-CYGNSS layer image.
     mode="shading" returns a semi-transparent raster.
     mode="contour" returns value-based contour lines colored with the same scale.
     """
@@ -354,14 +417,14 @@ def build_overlay_image(layer_name, start_date, end_date, mode="shading"):
         )
         vis = OVERLAY_LEGENDS["ndvi"]
 
-    elif layer_name == "population":
+    elif layer_name == "population_density":
         img = (
             ee.ImageCollection(POP_COLLECTION)
             .sort("system:time_start", False)
             .first()
-            .select("population_count")
+            .select("population_density")
         )
-        vis = OVERLAY_LEGENDS["population"]
+        vis = OVERLAY_LEGENDS["population_density"]
 
     elif layer_name == "elevation":
         img = ee.Image(ELEVATION_IMAGE).select("elevation")
@@ -381,49 +444,80 @@ def build_overlay_image(layer_name, start_date, end_date, mode="shading"):
     )
 
 
-def add_optional_overlays(base_rgb, start_date, end_date, shading_layer, contour_layer):
-    out = base_rgb
+def empty_visual_image():
+    return ee.Image(0).selfMask().visualize(
+        min=0,
+        max=1,
+        palette=["#000000"],
+        opacity=0.0,
+    )
 
-    shading = build_overlay_image(shading_layer, start_date, end_date, mode="shading")
-    if shading is not None:
-        out = out.blend(shading)
 
-    contour = build_overlay_image(contour_layer, start_date, end_date, mode="contour")
-    if contour is not None:
-        out = out.blend(contour)
+def build_layer_image(
+    layer_name,
+    selected_days,
+    thr_min,
+    thr_max,
+    start_date,
+    end_date,
+    mode="shading",
+):
+    if layer_name == "none":
+        return None
+    if is_cygnss_layer(layer_name):
+        return build_cygnss_image(layer_name, selected_days, thr_min, thr_max, mode=mode)
+    return build_external_layer_image(layer_name, start_date, end_date, mode=mode)
 
-    return out
 
 def build_side_visual_image(
     selected_days,
     thr_min,
     thr_max,
-    kind,
-    band_index,
     start_date,
     end_date,
     shading_layer,
     contour_layer,
 ):
-    mean_image = build_mean_image(selected_days, thr_min, thr_max, kind, band_index)
-    palette = PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND
-
-    base_rgb = mean_image.select(0).visualize(
-        min=thr_min,
-        max=thr_max,
-        palette=palette,
-    )
-
-    return add_optional_overlays(
-        base_rgb,
+    """
+    Build one side of the map. CYGNSS is no longer mandatory:
+    it can be selected as shading, contour, or not selected at all.
+    """
+    base = build_layer_image(
+        shading_layer,
+        selected_days,
+        thr_min,
+        thr_max,
         start_date,
         end_date,
-        shading_layer=shading_layer,
-        contour_layer=contour_layer,
+        mode="shading",
     )
 
+    if base is None:
+        base = empty_visual_image()
 
-# ---------------------------------------------
+    contour = build_layer_image(
+        contour_layer,
+        selected_days,
+        thr_min,
+        thr_max,
+        start_date,
+        end_date,
+        mode="contour",
+    )
+
+    if contour is not None:
+        base = base.blend(contour)
+
+    return base
+
+
+def selected_cygnss_layer(shading_layer, contour_layer):
+    """Return the first CYGNSS layer selected on a side, used for statistics."""
+    if is_cygnss_layer(shading_layer):
+        return shading_layer
+    if is_cygnss_layer(contour_layer):
+        return contour_layer
+    return None
 # TIME SERIES FOR AREA (CACHE)
 # ---------------------------------------------
 @st.cache_data
@@ -668,6 +762,7 @@ def add_colorbar(
     palette,
     vmin,
     vmax,
+    unit="",
     position="left",
     bottom="40px",
 ):
@@ -675,10 +770,11 @@ def add_colorbar(
     labels = [vmin + (vmax - vmin) * i / (n - 1) for i in range(n)]
 
     rows = ""
+    unit_txt = f" {unit}" if unit else ""
     for val, col in zip(labels, palette):
         rows += (
             f"<i style='background:{col}; width:18px; height:10px; "
-            f"float:left; margin-right:4px;'></i> {val:.1f}<br>"
+            f"float:left; margin-right:4px;'></i> {val:.1f}{unit_txt}<br>"
         )
 
     side = "left:40px;" if position == "left" else "right:40px;"
@@ -688,7 +784,7 @@ def add_colorbar(
         position: fixed;
         bottom: {bottom};
         {side}
-        width: 260px;
+        width: 280px;
         background-color: white;
         color: black;
         padding: 10px;
@@ -704,15 +800,27 @@ def add_colorbar(
     m.get_root().html.add_child(folium.Element(html))
 
 
+def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, position, bottom, role):
+    if layer_name == "none":
+        return
+    cfg = get_layer_legend(layer_name, thr_min, thr_max)
+    if cfg is None:
+        return
+    add_colorbar(
+        m,
+        title=f"{side_name} {role}: {cfg['title']}",
+        palette=cfg["palette"],
+        vmin=cfg["min"],
+        vmax=cfg["max"],
+        unit=cfg.get("unit", ""),
+        position=position,
+        bottom=bottom,
+    )
+
+
 def build_map(
     left_visual_image,
     left_label,
-    left_thr_min,
-    left_thr_max,
-    left_kind,
-    right_thr_min=None,
-    right_thr_max=None,
-    right_kind=None,
     saved_feature=None,
     map_center=None,
     map_zoom=None,
@@ -722,6 +830,10 @@ def build_map(
     left_contour_layer="none",
     right_shading_layer="none",
     right_contour_layer="none",
+    left_thr_min=None,
+    left_thr_max=None,
+    right_thr_min=None,
+    right_thr_max=None,
 ):
     try:
         if map_center is None:
@@ -791,79 +903,23 @@ def build_map(
                 },
             ).add_to(m)
 
-        # MAIN CYGNSS colorbar
-        main_palette = PALETTE_ANOM if left_kind == "anomaly" else PALETTE_INUND
-        add_colorbar(
-            m,
-            title=f"MAIN CYGNSS ({left_thr_min} → {left_thr_max})",
-            palette=main_palette,
-            vmin=left_thr_min,
-            vmax=left_thr_max,
-            position="left",
-            bottom="40px",
+        add_layer_colorbar(
+            m, "MAIN", left_shading_layer, left_thr_min, left_thr_max,
+            position="left", bottom="40px", role="shading"
+        )
+        add_layer_colorbar(
+            m, "MAIN", left_contour_layer, left_thr_min, left_thr_max,
+            position="left", bottom="260px", role="contour"
         )
 
-        # SECONDARY CYGNSS colorbar
-        if right_visual_image is not None and right_kind is not None and right_thr_min is not None and right_thr_max is not None:
-            secondary_palette = PALETTE_ANOM if right_kind == "anomaly" else PALETTE_INUND
-            add_colorbar(
-                m,
-                title=f"SECONDARY CYGNSS ({right_thr_min} → {right_thr_max})",
-                palette=secondary_palette,
-                vmin=right_thr_min,
-                vmax=right_thr_max,
-                position="right",
-                bottom="40px",
+        if right_visual_image is not None:
+            add_layer_colorbar(
+                m, "SECONDARY", right_shading_layer, right_thr_min, right_thr_max,
+                position="right", bottom="40px", role="shading"
             )
-
-        # MAIN optional layer colorbars
-        if left_shading_layer != "none":
-            cfg = OVERLAY_LEGENDS[left_shading_layer]
-            add_colorbar(
-                m,
-                title=f"MAIN shading: {cfg['title']}",
-                palette=cfg["palette"],
-                vmin=cfg["min"],
-                vmax=cfg["max"],
-                position="left",
-                bottom="260px",
-            )
-
-        if left_contour_layer != "none":
-            cfg = OVERLAY_LEGENDS[left_contour_layer]
-            add_colorbar(
-                m,
-                title=f"MAIN contour: {cfg['title']}",
-                palette=cfg["palette"],
-                vmin=cfg["min"],
-                vmax=cfg["max"],
-                position="left",
-                bottom="480px",
-            )
-
-        # SECONDARY optional layer colorbars
-        if right_shading_layer != "none":
-            cfg = OVERLAY_LEGENDS[right_shading_layer]
-            add_colorbar(
-                m,
-                title=f"SECONDARY shading: {cfg['title']}",
-                palette=cfg["palette"],
-                vmin=cfg["min"],
-                vmax=cfg["max"],
-                position="right",
-                bottom="260px",
-            )
-
-        if right_contour_layer != "none":
-            cfg = OVERLAY_LEGENDS[right_contour_layer]
-            add_colorbar(
-                m,
-                title=f"SECONDARY contour: {cfg['title']}",
-                palette=cfg["palette"],
-                vmin=cfg["min"],
-                vmax=cfg["max"],
-                position="right",
-                bottom="480px",
+            add_layer_colorbar(
+                m, "SECONDARY", right_contour_layer, right_thr_min, right_thr_max,
+                position="right", bottom="260px", role="contour"
             )
 
         folium.LayerControl().add_to(m)
@@ -872,9 +928,6 @@ def build_map(
     except Exception as e:
         st.error(f"Earth Engine map rendering failed: {e}")
         st.stop()
-
-
-# ---------------------------------------------
 # ALTAIR PLOT – MIN / MAX / MEAN
 # ---------------------------------------------
 def plot_timeseries(df, title, kind, thr_max):
@@ -1016,8 +1069,10 @@ def build_png_report(view_info, stats_info):
         f"MAIN: {view_info['left_label']}",
         f"SECONDARY: {view_info['right_label']}",
         f"Map center: {view_info['map_center'][0]:.4f}, {view_info['map_center'][1]:.4f} | zoom: {view_info['map_zoom']}",
-        f"Overlays LEFT: CHIRPS={view_info['left_chirps']}, NDVI={view_info['left_ndvi']}, POP={view_info['left_pop']}",
-        f"Overlays RIGHT: CHIRPS={view_info['right_chirps']}, NDVI={view_info['right_ndvi']}, POP={view_info['right_pop']}",
+        f"MAIN shading: {view_info['left_shading']}",
+        f"MAIN contour: {view_info['left_contour']}",
+        f"SECONDARY shading: {view_info['right_shading']}",
+        f"SECONDARY contour: {view_info['right_contour']}",
     ]
     for line in header_lines:
         draw.text((left_margin, y), line, fill="black", font=font_body)
@@ -1145,13 +1200,14 @@ def render_fullpage_screenshot_button():
 
 
 # ---------------------------------------------
+# ---------------------------------------------
 # APP HEADER
 # ---------------------------------------------
 st.title("CYGNSS – Regional Viewer")
 st.caption(
-    "Compare MAIN/SECONDARY CYGNSS bands over independent date ranges and optional GEE overlays "
-    "(CHIRPS precipitation, NDVI, population, elevation). "
-    "Statistics are calculated only for the MAIN CYGNSS asset layer."
+    "Compare MAIN/SECONDARY map layers over independent date ranges. "
+    "Each side can use one shading layer and one contour layer. "
+    "CYGNSS bands are selectable as ordinary layers."
 )
 
 # ---------------------------------------------
@@ -1178,11 +1234,21 @@ left_col, right_col = st.columns(2)
 
 with left_col:
     st.markdown("### MAIN panel")
-    left_band_number = st.selectbox(
-        "MAIN band:",
-        list(BAND_OPTIONS.keys()),
+
+    left_shading_layer = st.selectbox(
+        "MAIN shading layer:",
+        list(LAYER_OPTIONS.keys()),
+        index=list(LAYER_OPTIONS.keys()).index("cygnss_1"),
+        format_func=lambda k: LAYER_OPTIONS[k],
+        key="left_shading_layer",
+    )
+
+    left_contour_layer = st.selectbox(
+        "MAIN contour layer:",
+        list(LAYER_OPTIONS.keys()),
         index=0,
-        format_func=lambda b: BAND_OPTIONS[b],
+        format_func=lambda k: LAYER_OPTIONS[k],
+        key="left_contour_layer",
     )
 
     left_date_range = st.date_input(
@@ -1194,29 +1260,24 @@ with left_col:
         key="left_date_range",
     )
 
-    left_shading_layer = st.selectbox(
-        "MAIN shading layer:",
-        list(OVERLAY_OPTIONS.keys()),
-        index=0,
-        format_func=lambda k: OVERLAY_OPTIONS[k],
-        key="left_shading_layer",
-    )
-
-    left_contour_layer = st.selectbox(
-        "MAIN contour layer:",
-        list(OVERLAY_OPTIONS.keys()),
-        index=0,
-        format_func=lambda k: OVERLAY_OPTIONS[k],
-        key="left_contour_layer",
-    )
-
 with right_col:
     st.markdown("### SECONDARY panel")
-    right_band_number = st.selectbox(
-        "SECONDARY band:",
-        list(BAND_OPTIONS.keys()),
+
+    right_shading_layer = st.selectbox(
+        "SECONDARY shading layer:",
+        list(LAYER_OPTIONS.keys()),
+        index=list(LAYER_OPTIONS.keys()).index("cygnss_1"),
+        format_func=lambda k: LAYER_OPTIONS[k],
+        key="right_shading_layer",
+        disabled=not split_view,
+    )
+
+    right_contour_layer = st.selectbox(
+        "SECONDARY contour layer:",
+        list(LAYER_OPTIONS.keys()),
         index=0,
-        format_func=lambda b: BAND_OPTIONS[b],
+        format_func=lambda k: LAYER_OPTIONS[k],
+        key="right_contour_layer",
         disabled=not split_view,
     )
 
@@ -1230,24 +1291,6 @@ with right_col:
         disabled=not split_view,
     )
 
-    right_shading_layer = st.selectbox(
-        "SECONDARY shading layer:",
-        list(OVERLAY_OPTIONS.keys()),
-        index=0,
-        format_func=lambda k: OVERLAY_OPTIONS[k],
-        key="right_shading_layer",
-        disabled=not split_view,
-    )
-
-    right_contour_layer = st.selectbox(
-        "SECONDARY contour layer:",
-        list(OVERLAY_OPTIONS.keys()),
-        index=0,
-        format_func=lambda k: OVERLAY_OPTIONS[k],
-        key="right_contour_layer",
-        disabled=not split_view,
-    )
-
 left_start_date, left_end_date = parse_date_range(left_date_range)
 if left_start_date is None:
     st.warning("Invalid MAIN date range.")
@@ -1258,16 +1301,12 @@ if not left_sel_days:
     st.warning("No valid MAIN dataset days found in selected range.")
     st.stop()
 
-left_kind = band_kind(left_band_number)
-left_band_index = left_band_number - 1
-left_label = (
-    f"MAIN | {BAND_OPTIONS[left_band_number]} | "
-    f"{left_start_date.strftime('%Y-%m-%d')}→{left_end_date.strftime('%Y-%m-%d')}"
-)
+left_cygnss_layer = selected_cygnss_layer(left_shading_layer, left_contour_layer)
+left_kind_for_thr = cygnss_layer_kind(left_cygnss_layer) if left_cygnss_layer else "inundation"
 
-if left_kind == "anomaly":
+if left_kind_for_thr == "anomaly":
     left_thr_min, left_thr_max = st.slider(
-        "MAIN threshold range:",
+        "MAIN CYGNSS threshold range:",
         min_value=-100,
         max_value=100,
         value=(-100, 100),
@@ -1276,7 +1315,7 @@ if left_kind == "anomaly":
     )
 else:
     left_thr_min, left_thr_max = st.slider(
-        "MAIN threshold range:",
+        "MAIN CYGNSS threshold range:",
         min_value=0,
         max_value=100,
         value=(0, 100),
@@ -1287,6 +1326,19 @@ else:
 if left_thr_min >= left_thr_max:
     st.error("MAIN lower threshold must be smaller than upper threshold.")
     st.stop()
+
+if is_cygnss_layer(left_shading_layer) and is_cygnss_layer(left_contour_layer):
+    if cygnss_layer_kind(left_shading_layer) != cygnss_layer_kind(left_contour_layer):
+        st.warning(
+            "MAIN uses one CYGNSS threshold slider for both CYGNSS layers. "
+            "You selected one normal band and one anomaly band, so the same threshold range may not fit both."
+        )
+
+left_label = (
+    f"MAIN | shading: {LAYER_OPTIONS[left_shading_layer]} | "
+    f"contour: {LAYER_OPTIONS[left_contour_layer]} | "
+    f"{left_start_date.strftime('%Y-%m-%d')}→{left_end_date.strftime('%Y-%m-%d')}"
+)
 
 if split_view:
     right_start_date, right_end_date = parse_date_range(right_date_range)
@@ -1299,16 +1351,12 @@ if split_view:
         st.warning("No valid SECONDARY dataset days found in selected range.")
         st.stop()
 
-    right_kind = band_kind(right_band_number)
-    right_band_index = right_band_number - 1
-    right_label = (
-        f"SECONDARY | {BAND_OPTIONS[right_band_number]} | "
-        f"{right_start_date.strftime('%Y-%m-%d')}→{right_end_date.strftime('%Y-%m-%d')}"
-    )
+    right_cygnss_layer = selected_cygnss_layer(right_shading_layer, right_contour_layer)
+    right_kind_for_thr = cygnss_layer_kind(right_cygnss_layer) if right_cygnss_layer else "inundation"
 
-    if right_kind == "anomaly":
+    if right_kind_for_thr == "anomaly":
         right_thr_min, right_thr_max = st.slider(
-            "SECONDARY threshold range:",
+            "SECONDARY CYGNSS threshold range:",
             min_value=-100,
             max_value=100,
             value=(-100, 100),
@@ -1317,7 +1365,7 @@ if split_view:
         )
     else:
         right_thr_min, right_thr_max = st.slider(
-            "SECONDARY threshold range:",
+            "SECONDARY CYGNSS threshold range:",
             min_value=0,
             max_value=100,
             value=(0, 100),
@@ -1328,22 +1376,31 @@ if split_view:
     if right_thr_min >= right_thr_max:
         st.error("SECONDARY lower threshold must be smaller than upper threshold.")
         st.stop()
+
+    if is_cygnss_layer(right_shading_layer) and is_cygnss_layer(right_contour_layer):
+        if cygnss_layer_kind(right_shading_layer) != cygnss_layer_kind(right_contour_layer):
+            st.warning(
+                "SECONDARY uses one CYGNSS threshold slider for both CYGNSS layers. "
+                "You selected one normal band and one anomaly band, so the same threshold range may not fit both."
+            )
+
+    right_label = (
+        f"SECONDARY | shading: {LAYER_OPTIONS[right_shading_layer]} | "
+        f"contour: {LAYER_OPTIONS[right_contour_layer]} | "
+        f"{right_start_date.strftime('%Y-%m-%d')}→{right_end_date.strftime('%Y-%m-%d')}"
+    )
 else:
     right_sel_days = None
     right_start_date = None
     right_end_date = None
-    right_kind = None
-    right_band_index = None
     right_thr_min = None
     right_thr_max = None
     right_label = None
-    right_shading_layer = "none"
-    right_contour_layer = "none"
+    right_cygnss_layer = None
 
 st.write("MAIN dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in left_selected_dates))
 if split_view and right_start_date is not None:
     st.write("SECONDARY dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in right_selected_dates))
-
 # ---------------------------------------------
 # BUILD IMAGES FOR MAP
 # ---------------------------------------------
@@ -1352,8 +1409,6 @@ try:
         selected_days=left_sel_days,
         thr_min=left_thr_min,
         thr_max=left_thr_max,
-        kind=left_kind,
-        band_index=left_band_index,
         start_date=left_start_date,
         end_date=left_end_date,
         shading_layer=left_shading_layer,
@@ -1370,8 +1425,6 @@ if split_view and right_sel_days is not None:
             selected_days=right_sel_days,
             thr_min=right_thr_min,
             thr_max=right_thr_max,
-            kind=right_kind,
-            band_index=right_band_index,
             start_date=right_start_date,
             end_date=right_end_date,
             shading_layer=right_shading_layer,
@@ -1387,12 +1440,6 @@ if split_view and right_sel_days is not None:
 m = build_map(
     left_visual_image=left_visual_image,
     left_label=left_label,
-    left_thr_min=left_thr_min,
-    left_thr_max=left_thr_max,
-    left_kind=left_kind,
-    right_thr_min=right_thr_min,
-    right_thr_max=right_thr_max,
-    right_kind=right_kind,
     saved_feature=st.session_state.saved_feature,
     map_center=st.session_state.map_center,
     map_zoom=st.session_state.map_zoom,
@@ -1400,8 +1447,12 @@ m = build_map(
     right_label=right_label,
     left_shading_layer=left_shading_layer,
     left_contour_layer=left_contour_layer,
-    right_shading_layer=right_shading_layer,
-    right_contour_layer=right_contour_layer,
+    right_shading_layer=right_shading_layer if split_view else "none",
+    right_contour_layer=right_contour_layer if split_view else "none",
+    left_thr_min=left_thr_min,
+    left_thr_max=left_thr_max,
+    right_thr_min=right_thr_min,
+    right_thr_max=right_thr_max,
 )
 
 map_state = st_folium(
@@ -1427,11 +1478,9 @@ if current_feature and "geometry" in current_feature:
 feature = st.session_state.saved_feature
 
 st.markdown("---")
-
+# STATS & COUNTS FOR SELECTED REGION (MAIN CYGNSS ONLY, IF SELECTED)
 # ---------------------------------------------
-# STATS & COUNTS FOR SELECTED REGION (LEFT ONLY)
-# ---------------------------------------------
-st.subheader("Statistics and pixel counts for the drawn area (MAIN asset layer only)")
+st.subheader("Statistics and pixel counts for the drawn area")
 
 user_min = user_max = user_mean = None
 left_sel_days_tuple = tuple(left_sel_days)
@@ -1439,98 +1488,107 @@ pixel_count_inrange = None
 pixel_count_total = None
 region_drawn = "No"
 
-if feature and "geometry" in feature:
-    geom = feature["geometry"]
-    coords = geom.get("coordinates", [])
-
-    if coords and isinstance(coords[0], list):
-        region_drawn = "Yes"
-        ring = coords[0]
-        lons = [c[0] for c in ring]
-        lats = [c[1] for c in ring]
-        xmin, xmax = min(lons), max(lons)
-        ymin, ymax = min(lats), max(lats)
-
-        user_min, user_max, user_mean = compute_region_summary_for_bbox(
-            left_sel_days_tuple,
-            left_thr_min,
-            left_thr_max,
-            xmin,
-            ymin,
-            xmax,
-            ymax,
-            left_kind,
-            left_band_index,
-        )
-
-        pixel_count_inrange, pixel_count_total = compute_region_pixel_count(
-            left_sel_days_tuple,
-            left_thr_min,
-            left_thr_max,
-            xmin,
-            ymin,
-            xmax,
-            ymax,
-            left_kind,
-            left_band_index,
-        )
-
-        region_ts = compute_region_ts_for_bbox(
-            left_sel_days_tuple,
-            left_thr_min,
-            left_thr_max,
-            xmin,
-            ymin,
-            xmax,
-            ymax,
-            left_kind,
-            left_band_index,
-        )
-
-        if any(v is None for v in (user_min, user_max, user_mean)) or pixel_count_total == 0:
-            st.info(
-                "There are no valid pixels in the selected area "
-                "for the chosen MAIN thresholds/scale. Try a larger area or different thresholds."
-            )
-        else:
-            c1, c2, c3, c4, c5 = st.columns(5)
-
-            if left_kind == "anomaly":
-                c1.metric("Min anomaly (area)", f"{user_min:.4f}")
-                c2.metric("Max anomaly (area)", f"{user_max:.4f}")
-                c3.metric("Mean anomaly (area)", f"{user_mean:.4f}")
-                c4.metric("In-range pixels (at least once in selected period)", f"{pixel_count_inrange}")
-                c5.metric("Total valid pixels (at least once in selected period)", f"{pixel_count_total}")
-            else:
-                c1.metric("Min (area)", f"{user_min:.4f}")
-                c2.metric("Max (area)", f"{user_max:.4f}")
-                c3.metric("Mean (area)", f"{user_mean:.4f}")
-                c4.metric("In-range pixels (at least once in selected period)", f"{pixel_count_inrange}")
-                c5.metric("Total valid pixels (at least once in selected period)", f"{pixel_count_total}")
-
-            if region_ts:
-                df_r = pd.DataFrame(region_ts)
-                df_r = df_r.sort_values("date").set_index("date")
-
-                col_ts, col_cnt = st.columns(2)
-
-                with col_ts:
-                    title_ts = (
-                        f"Min / Max / Mean anomaly time series (MAIN area, band {left_band_number})"
-                        if left_kind == "anomaly"
-                        else f"Min / Max / Mean time series (MAIN area, band {left_band_number})"
-                    )
-                    plot_timeseries(df_r, title_ts, left_kind, left_thr_max)
-
-                with col_cnt:
-                    title_cnt = f"Daily pixel counts in MAIN area (band {left_band_number})"
-                    plot_pixelcount_timeseries(df_r, title_cnt)
-            else:
-                st.info("No data available to draw MAIN time series for the selected area (after masking).")
-    else:
-        st.info("Draw a rectangular area on the map using the drawing tool.")
+if left_cygnss_layer is None:
+    st.info("No CYGNSS layer is selected on MAIN. Statistics are currently calculated only for a selected MAIN CYGNSS layer.")
 else:
-    st.info("Draw a rectangular area on the map using the drawing tool (rectangle icon in the top-left corner).")
+    stats_band_number = cygnss_band_number(left_cygnss_layer)
+    stats_kind = band_kind(stats_band_number)
+    stats_band_index = stats_band_number - 1
+
+    st.caption(f"Stats source: MAIN {LAYER_OPTIONS[left_cygnss_layer]}")
+
+    if feature and "geometry" in feature:
+        geom = feature["geometry"]
+        coords = geom.get("coordinates", [])
+
+        if coords and isinstance(coords[0], list):
+            region_drawn = "Yes"
+            ring = coords[0]
+            lons = [c[0] for c in ring]
+            lats = [c[1] for c in ring]
+            xmin, xmax = min(lons), max(lons)
+            ymin, ymax = min(lats), max(lats)
+
+            user_min, user_max, user_mean = compute_region_summary_for_bbox(
+                left_sel_days_tuple,
+                left_thr_min,
+                left_thr_max,
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                stats_kind,
+                stats_band_index,
+            )
+
+            pixel_count_inrange, pixel_count_total = compute_region_pixel_count(
+                left_sel_days_tuple,
+                left_thr_min,
+                left_thr_max,
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                stats_kind,
+                stats_band_index,
+            )
+
+            region_ts = compute_region_ts_for_bbox(
+                left_sel_days_tuple,
+                left_thr_min,
+                left_thr_max,
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                stats_kind,
+                stats_band_index,
+            )
+
+            if any(v is None for v in (user_min, user_max, user_mean)) or pixel_count_total == 0:
+                st.info(
+                    "There are no valid pixels in the selected area "
+                    "for the chosen MAIN thresholds/scale. Try a larger area or different thresholds."
+                )
+            else:
+                c1, c2, c3, c4, c5 = st.columns(5)
+
+                if stats_kind == "anomaly":
+                    c1.metric("Min anomaly (area)", f"{user_min:.4f}")
+                    c2.metric("Max anomaly (area)", f"{user_max:.4f}")
+                    c3.metric("Mean anomaly (area)", f"{user_mean:.4f}")
+                    c4.metric("In-range pixels", f"{pixel_count_inrange}")
+                    c5.metric("Total valid pixels", f"{pixel_count_total}")
+                else:
+                    c1.metric("Min (area)", f"{user_min:.4f}")
+                    c2.metric("Max (area)", f"{user_max:.4f}")
+                    c3.metric("Mean (area)", f"{user_mean:.4f}")
+                    c4.metric("In-range pixels", f"{pixel_count_inrange}")
+                    c5.metric("Total valid pixels", f"{pixel_count_total}")
+
+                if region_ts:
+                    df_r = pd.DataFrame(region_ts)
+                    df_r = df_r.sort_values("date").set_index("date")
+
+                    col_ts, col_cnt = st.columns(2)
+
+                    with col_ts:
+                        title_ts = (
+                            f"Min / Max / Mean anomaly time series (MAIN area, {cygnss_layer_label(left_cygnss_layer)})"
+                            if stats_kind == "anomaly"
+                            else f"Min / Max / Mean time series (MAIN area, {cygnss_layer_label(left_cygnss_layer)})"
+                        )
+                        plot_timeseries(df_r, title_ts, stats_kind, left_thr_max)
+
+                    with col_cnt:
+                        title_cnt = f"Daily pixel counts in MAIN area ({cygnss_layer_label(left_cygnss_layer)})"
+                        plot_pixelcount_timeseries(df_r, title_cnt)
+                else:
+                    st.info("No data available to draw MAIN time series for the selected area after masking.")
+        else:
+            st.info("Draw a rectangular area on the map using the drawing tool.")
+    else:
+        st.info("Draw a rectangular area on the map using the drawing tool (rectangle icon in the top-left corner).")
 
 st.markdown("---")
 st.subheader("Export PNG")
@@ -1543,10 +1601,10 @@ view_info = {
     "right_label": right_label if right_label is not None else "Split view disabled",
     "map_center": st.session_state.map_center,
     "map_zoom": st.session_state.map_zoom,
-        "left_shading": OVERLAY_OPTIONS[left_shading_layer],
-    "left_contour": OVERLAY_OPTIONS[left_contour_layer],
-    "right_shading": OVERLAY_OPTIONS[right_shading_layer] if split_view else "None",
-    "right_contour": OVERLAY_OPTIONS[right_contour_layer] if split_view else "None",
+    "left_shading": LAYER_OPTIONS[left_shading_layer],
+    "left_contour": LAYER_OPTIONS[left_contour_layer],
+    "right_shading": LAYER_OPTIONS[right_shading_layer] if split_view else "None",
+    "right_contour": LAYER_OPTIONS[right_contour_layer] if split_view else "None",
 }
 
 stats_info = {
