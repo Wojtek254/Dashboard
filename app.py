@@ -829,22 +829,22 @@ def build_png_report(view_info, stats_info):
     y += line_h * 2
 
     header_lines = [
-        f"LEFT: {view_info['left_label']}",
-        f"RIGHT: {view_info['right_label']}",
+        f"MAIN: {view_info['left_label']}",
+        f"SECONDARY: {view_info['right_label']}",
         f"Map center: {view_info['map_center'][0]:.4f}, {view_info['map_center'][1]:.4f} | zoom: {view_info['map_zoom']}",
-        f"Overlays LEFT: CHIRPS={view_info['left_chirps']}, NDVI={view_info['left_ndvi']}, POP={view_info['left_pop']}",
-        f"Overlays RIGHT: CHIRPS={view_info['right_chirps']}, NDVI={view_info['right_ndvi']}, POP={view_info['right_pop']}",
+        f"Overlays MAIN: CHIRPS={view_info['left_chirps']}, NDVI={view_info['left_ndvi']}, POP={view_info['left_pop']}",
+        f"Overlays SECONDARY: CHIRPS={view_info['right_chirps']}, NDVI={view_info['right_ndvi']}, POP={view_info['right_pop']}",
     ]
     for line in header_lines:
         draw.text((left_margin, y), line, fill="black", font=font_body)
         y += line_h
 
     y += line_h
-    draw.text((left_margin, y), "LEFT statistics", fill="black", font=font_title)
+    draw.text((left_margin, y), "MAIN statistics", fill="black", font=font_title)
     y += line_h * 2
 
     rows = [
-        ("Stats source", "LEFT asset layer only"),
+        ("Stats source", "MAIN asset layer only"),
         ("Threshold range", f"{stats_info['thr_min']} → {stats_info['thr_max']}"),
         ("Region drawn", stats_info["region_drawn"]),
         ("Min", stats_info["min"]),
@@ -967,7 +967,7 @@ st.title("CYGNSS – Regional Viewer")
 st.caption(
     "Compare left/right CYGNSS bands over independent date ranges and optional GEE overlays "
     "(CHIRPS precipitation, NDVI, population). "
-    "Statistics are calculated only for the LEFT CYGNSS asset layer."
+    "Statistics are calculated only for the MAIN CYGNSS asset layer."
 )
 
 # ---------------------------------------------
@@ -993,16 +993,16 @@ split_view = st.checkbox(
 left_col, right_col = st.columns(2)
 
 with left_col:
-    st.markdown("### LEFT panel")
+    st.markdown("### MAIN panel")
     left_band_number = st.selectbox(
-        "LEFT band:",
+        "MAIN band:",
         list(BAND_OPTIONS.keys()),
         index=0,
         format_func=lambda b: BAND_OPTIONS[b],
     )
 
     left_date_range = st.date_input(
-        "LEFT date range (from–to):",
+        "MAIN date range (from–to):",
         value=(MIN_DATE, MIN_DATE),
         min_value=MIN_DATE,
         max_value=MAX_DATE,
@@ -1010,14 +1010,14 @@ with left_col:
         key="left_date_range",
     )
 
-    left_add_chirps = st.checkbox("LEFT: add CHIRPS precipitation layer", value=False)
-    left_add_ndvi = st.checkbox("LEFT: add NDVI layer", value=False)
-    left_add_population = st.checkbox("LEFT: add population layer", value=False)
+    left_add_chirps = st.checkbox("MAIN: add CHIRPS precipitation layer", value=False)
+    left_add_ndvi = st.checkbox("MAIN: add NDVI layer", value=False)
+    left_add_population = st.checkbox("MAIN: add population layer", value=False)
 
 with right_col:
-    st.markdown("### RIGHT panel")
+    st.markdown("### SECONDARY panel")
     right_band_number = st.selectbox(
-        "RIGHT band:",
+        "SECONDARY band:",
         list(BAND_OPTIONS.keys()),
         index=0,
         format_func=lambda b: BAND_OPTIONS[b],
@@ -1025,7 +1025,7 @@ with right_col:
     )
 
     right_date_range = st.date_input(
-        "RIGHT date range (from–to):",
+        "SECONDARY date range (from–to):",
         value=(MIN_DATE, MIN_DATE),
         min_value=MIN_DATE,
         max_value=MAX_DATE,
@@ -1035,21 +1035,21 @@ with right_col:
     )
 
     right_add_chirps = st.checkbox(
-        "RIGHT: add CHIRPS precipitation layer", value=False, disabled=not split_view
+        "SECONDARY: add CHIRPS precipitation layer", value=False, disabled=not split_view
     )
-    right_add_ndvi = st.checkbox("RIGHT: add NDVI layer", value=False, disabled=not split_view)
+    right_add_ndvi = st.checkbox("SECONDARY: add NDVI layer", value=False, disabled=not split_view)
     right_add_population = st.checkbox(
-        "RIGHT: add population layer", value=False, disabled=not split_view
+        "SECONDARY: add population layer", value=False, disabled=not split_view
     )
 
 left_start_date, left_end_date = parse_date_range(left_date_range)
 if left_start_date is None:
-    st.warning("Invalid LEFT date range.")
+    st.warning("Invalid MAIN date range.")
     st.stop()
 
 left_selected_dates, left_sel_days = dates_to_doys(left_start_date, left_end_date)
 if not left_sel_days:
-    st.warning("No valid LEFT dataset days found in selected range.")
+    st.warning("No valid MAIN dataset days found in selected range.")
     st.stop()
 
 left_kind = band_kind(left_band_number)
@@ -1061,7 +1061,7 @@ left_label = (
 
 if left_kind == "anomaly":
     left_thr_min, left_thr_max = st.slider(
-        "LEFT threshold range:",
+        "MAIN threshold range:",
         min_value=-100,
         max_value=100,
         value=(-100, 100),
@@ -1070,7 +1070,7 @@ if left_kind == "anomaly":
     )
 else:
     left_thr_min, left_thr_max = st.slider(
-        "LEFT threshold range:",
+        "MAIN threshold range:",
         min_value=0,
         max_value=100,
         value=(0, 100),
@@ -1079,18 +1079,18 @@ else:
     )
 
 if left_thr_min >= left_thr_max:
-    st.error("LEFT lower threshold must be smaller than upper threshold.")
+    st.error("MAIN lower threshold must be smaller than upper threshold.")
     st.stop()
 
 if split_view:
     right_start_date, right_end_date = parse_date_range(right_date_range)
     if right_start_date is None:
-        st.warning("Invalid RIGHT date range.")
+        st.warning("Invalid SECONDARY date range.")
         st.stop()
 
     right_selected_dates, right_sel_days = dates_to_doys(right_start_date, right_end_date)
     if not right_sel_days:
-        st.warning("No valid RIGHT dataset days found in selected range.")
+        st.warning("No valid SECONDARY dataset days found in selected range.")
         st.stop()
 
     right_kind = band_kind(right_band_number)
@@ -1102,7 +1102,7 @@ if split_view:
 
     if right_kind == "anomaly":
         right_thr_min, right_thr_max = st.slider(
-            "RIGHT threshold range:",
+            "SECONDARY threshold range:",
             min_value=-100,
             max_value=100,
             value=(-100, 100),
@@ -1111,7 +1111,7 @@ if split_view:
         )
     else:
         right_thr_min, right_thr_max = st.slider(
-            "RIGHT threshold range:",
+            "SECONDARY threshold range:",
             min_value=0,
             max_value=100,
             value=(0, 100),
@@ -1120,7 +1120,7 @@ if split_view:
         )
 
     if right_thr_min >= right_thr_max:
-        st.error("RIGHT lower threshold must be smaller than upper threshold.")
+        st.error("SECONDARY lower threshold must be smaller than upper threshold.")
         st.stop()
 else:
     right_sel_days = None
@@ -1132,9 +1132,9 @@ else:
     right_thr_max = None
     right_label = None
 
-st.write("LEFT dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in left_selected_dates))
+st.write("MAIN dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in left_selected_dates))
 if split_view and right_start_date is not None:
-    st.write("RIGHT dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in right_selected_dates))
+    st.write("SECONDARY dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in right_selected_dates))
 
 # ---------------------------------------------
 # BUILD IMAGES FOR MAP
@@ -1153,7 +1153,7 @@ try:
         add_population=left_add_population,
     )
 except Exception as e:
-    st.error(f"Failed to build LEFT image: {e}")
+    st.error(f"Failed to build MAIN image: {e}")
     st.stop()
 
 right_visual_image = None
@@ -1172,7 +1172,7 @@ if split_view and right_sel_days is not None:
             add_population=right_add_population,
         )
     except Exception as e:
-        st.error(f"Failed to build RIGHT image: {e}")
+        st.error(f"Failed to build SECONDARY image: {e}")
         st.stop()
 
 # ---------------------------------------------
@@ -1216,9 +1216,9 @@ feature = st.session_state.saved_feature
 st.markdown("---")
 
 # ---------------------------------------------
-# STATS & COUNTS FOR SELECTED REGION (LEFT ONLY)
+# STATS & COUNTS FOR SELECTED REGION (MAIN ONLY)
 # ---------------------------------------------
-st.subheader("Statistics and pixel counts for the drawn area (LEFT asset layer only)")
+st.subheader("Statistics and pixel counts for the drawn area (MAIN asset layer only)")
 
 user_min = user_max = user_mean = None
 left_sel_days_tuple = tuple(left_sel_days)
@@ -1277,7 +1277,7 @@ if feature and "geometry" in feature:
         if any(v is None for v in (user_min, user_max, user_mean)) or pixel_count_total == 0:
             st.info(
                 "There are no valid pixels in the selected area "
-                "for the chosen LEFT thresholds/scale. Try a larger area or different thresholds."
+                "for the chosen MAIN thresholds/scale. Try a larger area or different thresholds."
             )
         else:
             c1, c2, c3, c4, c5 = st.columns(5)
@@ -1303,17 +1303,17 @@ if feature and "geometry" in feature:
 
                 with col_ts:
                     title_ts = (
-                        f"Min / Max / Mean anomaly time series (LEFT area, band {left_band_number})"
+                        f"Min / Max / Mean anomaly time series (MAIN area, band {left_band_number})"
                         if left_kind == "anomaly"
-                        else f"Min / Max / Mean time series (LEFT area, band {left_band_number})"
+                        else f"Min / Max / Mean time series (MAIN area, band {left_band_number})"
                     )
                     plot_timeseries(df_r, title_ts, left_kind, left_thr_max)
 
                 with col_cnt:
-                    title_cnt = f"Daily pixel counts in LEFT area (band {left_band_number})"
+                    title_cnt = f"Daily pixel counts in MAIN area (band {left_band_number})"
                     plot_pixelcount_timeseries(df_r, title_cnt)
             else:
-                st.info("No data available to draw LEFT time series for the selected area (after masking).")
+                st.info("No data available to draw MAIN time series for the selected area (after masking).")
     else:
         st.info("Draw a rectangular area on the map using the drawing tool.")
 else:
