@@ -998,7 +998,7 @@ with left_col:
         "LEFT band:",
         list(BAND_OPTIONS.keys()),
         index=0,
-        format_func=lambda b: f"Band {b} – {BAND_OPTIONS[b]}",
+        format_func=lambda b: BAND_OPTIONS[b],
     )
 
     left_date_range = st.date_input(
@@ -1020,7 +1020,7 @@ with right_col:
         "RIGHT band:",
         list(BAND_OPTIONS.keys()),
         index=0,
-        format_func=lambda b: f"Band {b} – {BAND_OPTIONS[b]}",
+        format_func=lambda b: BAND_OPTIONS[b],
         disabled=not split_view,
     )
 
