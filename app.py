@@ -1055,7 +1055,7 @@ if not left_sel_days:
 left_kind = band_kind(left_band_number)
 left_band_index = left_band_number - 1
 left_label = (
-    f"LEFT | Band {left_band_number}: {BAND_OPTIONS[left_band_number]} | "
+    f"MAIN | {BAND_OPTIONS[left_band_number]} | "
     f"{left_start_date.strftime('%Y-%m-%d')}→{left_end_date.strftime('%Y-%m-%d')}"
 )
 
@@ -1064,7 +1064,7 @@ if left_kind == "anomaly":
         "LEFT threshold range:",
         min_value=-100,
         max_value=100,
-        value=(-20, 20),
+        value=(-100, 100),
         step=1,
         key="left_thr",
     )
@@ -1073,7 +1073,7 @@ else:
         "LEFT threshold range:",
         min_value=0,
         max_value=100,
-        value=(20, 100),
+        value=(0, 100),
         step=1,
         key="left_thr",
     )
@@ -1096,7 +1096,7 @@ if split_view:
     right_kind = band_kind(right_band_number)
     right_band_index = right_band_number - 1
     right_label = (
-        f"RIGHT | Band {right_band_number}: {BAND_OPTIONS[right_band_number]} | "
+        f"SECONDARY | {BAND_OPTIONS[right_band_number]} | "
         f"{right_start_date.strftime('%Y-%m-%d')}→{right_end_date.strftime('%Y-%m-%d')}"
     )
 
@@ -1105,7 +1105,7 @@ if split_view:
             "RIGHT threshold range:",
             min_value=-100,
             max_value=100,
-            value=(-20, 20),
+            value=(-100, 100),
             step=1,
             key="right_thr",
         )
@@ -1114,7 +1114,7 @@ if split_view:
             "RIGHT threshold range:",
             min_value=0,
             max_value=100,
-            value=(20, 100),
+            value=(0, 100),
             step=1,
             key="right_thr",
         )
