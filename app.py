@@ -653,6 +653,8 @@ def build_map(
     map_zoom=None,
     right_visual_image=None,
     right_label=None,
+    left_shading_layer=None,
+    right_shading_layer=None,
 ):
     try:
         if map_center is None:
@@ -1349,6 +1351,8 @@ m = build_map(
     map_zoom=st.session_state.map_zoom,
     right_visual_image=right_visual_image,
     right_label=right_label,
+    left_shading_layer=left_shading_layer,
+    right_shading_layer=right_shading_layer,
 )
 
 map_state = st_folium(
