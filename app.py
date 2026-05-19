@@ -85,6 +85,15 @@ BAND_OPTIONS = {
 CHIRPS_COLLECTION = "UCSB-CHG/CHIRPS/DAILY"
 NDVI_COLLECTION = "MODIS/061/MOD13Q1"
 POP_COLLECTION = "CIESIN/GPWv411/GPW_Population_Count"
+ELEVATION_IMAGE = "USGS/SRTMGL1_003"
+
+OVERLAY_OPTIONS = {
+    "none": "None",
+    "chirps": "CHIRPS precipitation",
+    "ndvi": "NDVI",
+    "population": "Population",
+    "elevation": "Elevation a.s.l.",
+}
 
 
 def band_kind(band_number: int) -> str:
@@ -248,60 +257,96 @@ def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
     return pixel_mean
 
 
-def add_optional_overlays(base_rgb, start_date, end_date, add_chirps, add_ndvi, add_population):
+def build_overlay_image(layer_name, start_date, end_date, mode="shading"):
     start_str = start_date.strftime("%Y-%m-%d")
     end_exclusive = (end_date + dt.timedelta(days=1)).strftime("%Y-%m-%d")
 
-    out = base_rgb
+    if layer_name == "none":
+        return None
 
-    if add_chirps:
-        chirps = (
+    if layer_name == "chirps":
+        img = (
             ee.ImageCollection(CHIRPS_COLLECTION)
             .filterDate(start_str, end_exclusive)
             .select("precipitation")
             .sum()
         )
-        chirps_vis = chirps.visualize(
+        vis = dict(
             min=0,
             max=20,
             palette=["#f7fbff", "#6baed6", "#2171b5", "#08306b"],
             opacity=0.55,
         )
-        out = out.blend(chirps_vis)
 
-    if add_ndvi:
-        ndvi = (
+    elif layer_name == "ndvi":
+        img = (
             ee.ImageCollection(NDVI_COLLECTION)
             .filterDate(start_str, end_exclusive)
             .select("NDVI")
             .mean()
             .multiply(0.0001)
         )
-        ndvi_vis = ndvi.visualize(
+        vis = dict(
             min=0.0,
             max=0.8,
             palette=["#f7fcf5", "#a1d99b", "#31a354", "#006d2c"],
             opacity=0.55,
         )
-        out = out.blend(ndvi_vis)
 
-    if add_population:
-        pop = (
+    elif layer_name == "population":
+        img = (
             ee.ImageCollection(POP_COLLECTION)
             .sort("system:time_start", False)
             .first()
             .select("population_count")
         )
-        pop_vis = pop.visualize(
+        vis = dict(
             min=0,
             max=1000,
             palette=["#ffffcc", "#ffeda0", "#feb24c", "#f03b20", "#bd0026"],
             opacity=0.5,
         )
-        out = out.blend(pop_vis)
+
+    elif layer_name == "elevation":
+        img = ee.Image(ELEVATION_IMAGE).select("elevation")
+        vis = dict(
+            min=0,
+            max=3000,
+            palette=["#f7fcf5", "#c7e9c0", "#74c476", "#238b45", "#00441b"],
+            opacity=0.55,
+        )
+
+    else:
+        return None
+
+    if mode == "contour":
+        contour = ee.Algorithms.CannyEdgeDetector(
+            image=img,
+            threshold=0.7,
+            sigma=1,
+        )
+        return contour.selfMask().visualize(
+            min=0,
+            max=1,
+            palette=["#ff0000"],
+            opacity=0.85,
+        )
+
+    return img.visualize(**vis)
+
+
+def add_optional_overlays(base_rgb, start_date, end_date, shading_layer, contour_layer):
+    out = base_rgb
+
+    shading = build_overlay_image(shading_layer, start_date, end_date, mode="shading")
+    if shading is not None:
+        out = out.blend(shading)
+
+    contour = build_overlay_image(contour_layer, start_date, end_date, mode="contour")
+    if contour is not None:
+        out = out.blend(contour)
 
     return out
-
 
 def build_side_visual_image(
     selected_days,
@@ -311,9 +356,8 @@ def build_side_visual_image(
     band_index,
     start_date,
     end_date,
-    add_chirps,
-    add_ndvi,
-    add_population,
+    shading_layer,
+    contour_layer,
 ):
     mean_image = build_mean_image(selected_days, thr_min, thr_max, kind, band_index)
     palette = PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND
@@ -328,9 +372,8 @@ def build_side_visual_image(
         base_rgb,
         start_date,
         end_date,
-        add_chirps=add_chirps,
-        add_ndvi=add_ndvi,
-        add_population=add_population,
+        shading_layer=shading_layer,
+        contour_layer=contour_layer,
     )
 
 
@@ -965,9 +1008,9 @@ def render_fullpage_screenshot_button():
 # ---------------------------------------------
 st.title("CYGNSS – Regional Viewer")
 st.caption(
-    "Compare left/right CYGNSS bands over independent date ranges and optional GEE overlays "
-    "(CHIRPS precipitation, NDVI, population). "
-    "Statistics are calculated only for the MAIN CYGNSS asset layer."
+    "Compare MAIN/SECONDARY CYGNSS bands over independent date ranges and optional GEE overlays "
+    "(one shading layer and one contour layer per side). "
+    "Statistics are calculated only for the LEFT CYGNSS asset layer."
 )
 
 # ---------------------------------------------
@@ -986,7 +1029,7 @@ if st.button("Clear selected region"):
     st.session_state.saved_feature = None
 
 split_view = st.checkbox(
-    "Enable split-view map comparison (left vs right)",
+    "Enable split-view map comparison (MAIN vs SECONDARY)",
     value=True,
 )
 
@@ -1010,9 +1053,21 @@ with left_col:
         key="left_date_range",
     )
 
-    left_add_chirps = st.checkbox("MAIN: add CHIRPS precipitation layer", value=False)
-    left_add_ndvi = st.checkbox("MAIN: add NDVI layer", value=False)
-    left_add_population = st.checkbox("MAIN: add population layer", value=False)
+    left_shading_layer = st.selectbox(
+        "MAIN shading layer:",
+        list(OVERLAY_OPTIONS.keys()),
+        index=0,
+        format_func=lambda k: OVERLAY_OPTIONS[k],
+        key="left_shading_layer",
+    )
+
+    left_contour_layer = st.selectbox(
+        "MAIN contour layer:",
+        list(OVERLAY_OPTIONS.keys()),
+        index=0,
+        format_func=lambda k: OVERLAY_OPTIONS[k],
+        key="left_contour_layer",
+    )
 
 with right_col:
     st.markdown("### SECONDARY panel")
@@ -1034,12 +1089,22 @@ with right_col:
         disabled=not split_view,
     )
 
-    right_add_chirps = st.checkbox(
-        "SECONDARY: add CHIRPS precipitation layer", value=False, disabled=not split_view
+    right_shading_layer = st.selectbox(
+        "SECONDARY shading layer:",
+        list(OVERLAY_OPTIONS.keys()),
+        index=0,
+        format_func=lambda k: OVERLAY_OPTIONS[k],
+        disabled=not split_view,
+        key="right_shading_layer",
     )
-    right_add_ndvi = st.checkbox("SECONDARY: add NDVI layer", value=False, disabled=not split_view)
-    right_add_population = st.checkbox(
-        "SECONDARY: add population layer", value=False, disabled=not split_view
+
+    right_contour_layer = st.selectbox(
+        "SECONDARY contour layer:",
+        list(OVERLAY_OPTIONS.keys()),
+        index=0,
+        format_func=lambda k: OVERLAY_OPTIONS[k],
+        disabled=not split_view,
+        key="right_contour_layer",
     )
 
 left_start_date, left_end_date = parse_date_range(left_date_range)
@@ -1148,9 +1213,8 @@ try:
         band_index=left_band_index,
         start_date=left_start_date,
         end_date=left_end_date,
-        add_chirps=left_add_chirps,
-        add_ndvi=left_add_ndvi,
-        add_population=left_add_population,
+        shading_layer=left_shading_layer,
+        contour_layer=left_contour_layer,
     )
 except Exception as e:
     st.error(f"Failed to build MAIN image: {e}")
@@ -1167,9 +1231,8 @@ if split_view and right_sel_days is not None:
             band_index=right_band_index,
             start_date=right_start_date,
             end_date=right_end_date,
-            add_chirps=right_add_chirps,
-            add_ndvi=right_add_ndvi,
-            add_population=right_add_population,
+            shading_layer=right_shading_layer,
+            contour_layer=right_contour_layer,
         )
     except Exception as e:
         st.error(f"Failed to build SECONDARY image: {e}")
@@ -1216,7 +1279,7 @@ feature = st.session_state.saved_feature
 st.markdown("---")
 
 # ---------------------------------------------
-# STATS & COUNTS FOR SELECTED REGION (MAIN ONLY)
+# STATS & COUNTS FOR SELECTED REGION (LEFT ONLY)
 # ---------------------------------------------
 st.subheader("Statistics and pixel counts for the drawn area (MAIN asset layer only)")
 
@@ -1313,7 +1376,7 @@ if feature and "geometry" in feature:
                     title_cnt = f"Daily pixel counts in MAIN area (band {left_band_number})"
                     plot_pixelcount_timeseries(df_r, title_cnt)
             else:
-                st.info("No data available to draw MAIN time series for the selected area (after masking).")
+                st.info("No data available to draw LEFT time series for the selected area (after masking).")
     else:
         st.info("Draw a rectangular area on the map using the drawing tool.")
 else:
@@ -1330,12 +1393,10 @@ view_info = {
     "right_label": right_label if right_label is not None else "Split view disabled",
     "map_center": st.session_state.map_center,
     "map_zoom": st.session_state.map_zoom,
-    "left_chirps": left_add_chirps,
-    "left_ndvi": left_add_ndvi,
-    "left_pop": left_add_population,
-    "right_chirps": right_add_chirps if split_view else False,
-    "right_ndvi": right_add_ndvi if split_view else False,
-    "right_pop": right_add_population if split_view else False,
+    "left_shading": OVERLAY_OPTIONS[left_shading_layer],
+    "left_contour": OVERLAY_OPTIONS[left_contour_layer],
+    "right_shading": OVERLAY_OPTIONS[right_shading_layer] if split_view else "Split view disabled",
+    "right_contour": OVERLAY_OPTIONS[right_contour_layer] if split_view else "Split view disabled",
 }
 
 stats_info = {
