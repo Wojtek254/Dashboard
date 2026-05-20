@@ -205,31 +205,52 @@ def get_collection(kind: str):
 
 
 # ---------------------------------------------
-# HELPER FUNCTIONS – INUNDATION
+# HELPER FUNCTIONS – CYGNSS BANDS
 # ---------------------------------------------
-def mask_inund_band(img, band_index, thr_min, thr_max):
+def cygnss_valid_raw_band(img, band_index):
+    """Return a CYGNSS band masked where the dataset uses 255 as no-data."""
     band = img.select(band_index)
-    mask = band.gte(thr_min).And(band.lte(thr_max)).And(band.lt(255))
+    return band.updateMask(band.lt(255))
+
+
+def cygnss_scaled_band(img, band_index):
+    """
+    Return a display/analysis-ready CYGNSS band.
+
+    Bands 4 and 5 are anomaly bands encoded with +100 offset,
+    so here they are converted back to real anomaly values by subtracting 100.
+    Other bands are kept unchanged.
+    """
+    band_number = band_index + 1
+    band = cygnss_valid_raw_band(img, band_index)
+
+    if band_number in (4, 5):
+        band = band.subtract(100)
+
+    return band.rename("value")
+
+
+def cygnss_thresholded_band(img, band_index, thr_min, thr_max):
+    band = cygnss_scaled_band(img, band_index)
+    mask = band.gte(thr_min).And(band.lte(thr_max))
     return band.updateMask(mask)
 
 
+# Backward-compatible names used later in the script
+def mask_inund_band(img, band_index, thr_min, thr_max):
+    return cygnss_thresholded_band(img, band_index, thr_min, thr_max)
+
+
 def inund_valid_band(img, band_index):
-    band = img.select(band_index)
-    return band.updateMask(band.lt(255))
+    return cygnss_valid_raw_band(img, band_index)
 
 
-# ---------------------------------------------
-# HELPER FUNCTIONS – ANOMALIES
-# ---------------------------------------------
 def anomaly_valid_band(img, band_index):
-    band = img.select(band_index)
-    return band.updateMask(band.lt(255))
+    return cygnss_scaled_band(img, band_index)
 
 
 def anomaly_thresholded(img, band_index, thr_min, thr_max):
-    band = anomaly_valid_band(img, band_index)
-    thr_mask = band.gte(thr_min).And(band.lte(thr_max))
-    return band.updateMask(thr_mask)
+    return cygnss_thresholded_band(img, band_index, thr_min, thr_max)
 
 
 # ---------------------------------------------
@@ -281,10 +302,9 @@ def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
     if size == 0:
         raise ValueError(f"No images found for selected days: {selected_days}")
 
-    if kind == "inundation":
-        ic_proc = ic_sel.map(lambda img: mask_inund_band(img, band_index, thr_min, thr_max))
-    else:
-        ic_proc = ic_sel.map(lambda img: anomaly_thresholded(img, band_index, thr_min, thr_max))
+    # This uses real values for all bands. For anomaly bands (4/5),
+    # the encoded +100 offset is removed before thresholding.
+    ic_proc = ic_sel.map(lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max))
 
     stacked = ic_proc.toBands()
     pixel_mean = stacked.reduce(ee.Reducer.mean())
@@ -308,8 +328,9 @@ def cygnss_layer_label(layer_name: str) -> str:
 
 
 def cygnss_unit(kind: str) -> str:
-    # For bands 1–3: inundation percentage. For bands 4–5: anomaly in percentage points.
-    return "pp" if kind == "anomaly" else "%"
+    # CYGNSS inundation and anomaly values are shown on the same percentage scale.
+    # Anomaly bands are decoded first by subtracting the +100 storage offset.
+    return "%"
 
 
 def cygnss_legend(layer_name, thr_min, thr_max):
@@ -650,10 +671,8 @@ def compute_region_summary_for_bbox(
     ic = get_collection(kind)
     ic_sel = ic.filter(ee.Filter.inList("day", selected_days))
 
-    if kind == "inundation":
-        ic_proc = ic_sel.map(lambda img: mask_inund_band(img, band_index, thr_min, thr_max))
-    else:
-        ic_proc = ic_sel.map(lambda img: anomaly_thresholded(img, band_index, thr_min, thr_max))
+    # Use decoded values for anomaly bands before thresholding/statistics.
+    ic_proc = ic_sel.map(lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max))
 
     stacked = ic_proc.toBands()
     pixel_mean = stacked.reduce(ee.Reducer.mean())
@@ -716,8 +735,8 @@ def compute_region_pixel_count(
             return band.lt(255).toInt()
 
         def inrange_mask(img):
-            band = img.select(band_index)
-            return band.lt(255).And(band.gte(thr_min)).And(band.lte(thr_max)).toInt()
+            band = cygnss_scaled_band(img, band_index)
+            return band.gte(thr_min).And(band.lte(thr_max)).toInt()
 
     valid_any = ic_sel.map(valid_mask).max()
     inrange_any = ic_sel.map(inrange_mask).max()
@@ -817,128 +836,6 @@ def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, position, bot
         bottom=bottom,
     )
 
-def is_cygnss_layer(layer_name):
-    return isinstance(layer_name, str) and layer_name.startswith("cygnss_")
-
-
-def cygnss_band_number(layer_name):
-    return int(layer_name.split("_")[1])
-
-
-def layer_unit(layer_name):
-    if is_cygnss_layer(layer_name):
-        band = cygnss_band_number(layer_name)
-        return "pp" if band in (4, 5) else "%"
-
-    units = {
-        "chirps": "mm",
-        "ndvi": "-",
-        "population_density": "people/km²",
-        "elevation": "m a.s.l.",
-    }
-    return units.get(layer_name, "")
-
-
-def build_raw_layer_image(
-    layer_name,
-    start_date,
-    end_date,
-    selected_days=None,
-    thr_min=None,
-    thr_max=None,
-):
-    start_str = start_date.strftime("%Y-%m-%d")
-    end_exclusive = (end_date + dt.timedelta(days=1)).strftime("%Y-%m-%d")
-
-    if layer_name == "none":
-        return None
-
-    if is_cygnss_layer(layer_name):
-        band_number = cygnss_band_number(layer_name)
-        band_index = band_number - 1
-        kind = band_kind(band_number)
-
-        img = build_mean_image(
-            selected_days=selected_days,
-            thr_min=thr_min,
-            thr_max=thr_max,
-            kind=kind,
-            band_index=band_index,
-        )
-
-        return img.rename("value")
-
-    if layer_name == "chirps":
-        return (
-            ee.ImageCollection(CHIRPS_COLLECTION)
-            .filterDate(start_str, end_exclusive)
-            .select("precipitation")
-            .sum()
-            .rename("value")
-        )
-
-    if layer_name == "ndvi":
-        return (
-            ee.ImageCollection(NDVI_COLLECTION)
-            .filterDate(start_str, end_exclusive)
-            .select("NDVI")
-            .mean()
-            .multiply(0.0001)
-            .rename("value")
-        )
-
-    if layer_name == "population_density":
-        return (
-            ee.ImageCollection(POP_COLLECTION)
-            .sort("system:time_start", False)
-            .first()
-            .select("population_density")
-            .rename("value")
-        )
-
-    if layer_name == "elevation":
-        return ee.Image(ELEVATION_IMAGE).select("elevation").rename("value")
-
-    return None
-
-
-def sample_layer_at_point(
-    layer_name,
-    lon,
-    lat,
-    start_date,
-    end_date,
-    selected_days=None,
-    thr_min=None,
-    thr_max=None,
-    scale=3000,
-):
-    if layer_name == "none":
-        return None
-
-    img = build_raw_layer_image(
-        layer_name=layer_name,
-        start_date=start_date,
-        end_date=end_date,
-        selected_days=selected_days,
-        thr_min=thr_min,
-        thr_max=thr_max,
-    )
-
-    if img is None:
-        return None
-
-    point = ee.Geometry.Point([lon, lat])
-
-    result = img.reduceRegion(
-        reducer=ee.Reducer.first(),
-        geometry=point,
-        scale=scale,
-        maxPixels=1e13,
-    ).getInfo()
-
-    value = result.get("value") if result else None
-    return value
 
 def build_map(
     left_visual_image,
@@ -1583,100 +1480,6 @@ map_state = st_folium(
     width=None,
     key="cygnss_map",
 )
-
-clicked = map_state.get("last_clicked") if map_state else None
-
-if clicked:
-    lat = clicked["lat"]
-    lon = clicked["lng"]
-
-    if split_view:
-        map_center_lon = st.session_state.map_center[1]
-        side = "MAIN" if lon < map_center_lon else "SECONDARY"
-    else:
-        side = "MAIN"
-
-    if side == "MAIN":
-        shading_layer = left_shading_layer
-        contour_layer = left_contour_layer
-        start_date = left_start_date
-        end_date = left_end_date
-        selected_days = left_sel_days
-        thr_min = left_thr_min
-        thr_max = left_thr_max
-    else:
-        shading_layer = right_shading_layer
-        contour_layer = right_contour_layer
-        start_date = right_start_date
-        end_date = right_end_date
-        selected_days = right_sel_days
-        thr_min = right_thr_min
-        thr_max = right_thr_max
-
-    try:
-        shading_value = sample_layer_at_point(
-            layer_name=shading_layer,
-            lon=lon,
-            lat=lat,
-            start_date=start_date,
-            end_date=end_date,
-            selected_days=selected_days,
-            thr_min=thr_min,
-            thr_max=thr_max,
-        )
-
-        contour_value = sample_layer_at_point(
-            layer_name=contour_layer,
-            lon=lon,
-            lat=lat,
-            start_date=start_date,
-            end_date=end_date,
-            selected_days=selected_days,
-            thr_min=thr_min,
-            thr_max=thr_max,
-        )
-
-        st.markdown("### Point inspection")
-
-        c1, c2, c3 = st.columns(3)
-
-        c1.metric("Side", side)
-        c2.metric("Latitude", f"{lat:.5f}")
-        c3.metric("Longitude", f"{lon:.5f}")
-
-        rows = []
-
-        if shading_layer != "none":
-            rows.append(
-                {
-                    "type": "shading",
-                    "layer": LAYER_OPTIONS[shading_layer],
-                    "value": shading_value,
-                    "unit": layer_unit(shading_layer),
-                }
-            )
-
-        if contour_layer != "none":
-            rows.append(
-                {
-                    "type": "contour",
-                    "layer": LAYER_OPTIONS[contour_layer],
-                    "value": contour_value,
-                    "unit": layer_unit(contour_layer),
-                }
-            )
-
-        if rows:
-            df_point = pd.DataFrame(rows)
-            df_point["value"] = df_point["value"].apply(
-                lambda v: "No data" if v is None else f"{float(v):.4f}"
-            )
-            st.dataframe(df_point, use_container_width=True, hide_index=True)
-        else:
-            st.info("No layer selected on this side.")
-
-    except Exception as e:
-        st.error(f"Point inspection failed: {e}")
 
 if map_state is not None:
     if map_state.get("center") is not None:
