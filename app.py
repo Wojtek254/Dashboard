@@ -3,6 +3,7 @@
 
 import datetime as dt
 import io
+import re
 
 import altair as alt
 import ee
@@ -29,25 +30,10 @@ st.set_page_config(
 PROJECT_ID = st.secrets["project_id"]
 ASSET_FOLDER = f"projects/{PROJECT_ID}/assets"
 
-# Julian days
-START_DOY = 305
-END_DOY = 336
-YEAR = 2025
-
-# Build list: [(doy, "YYYY-MM-DD"), ...]
-BASE_DATE = dt.date(YEAR, 1, 1) + dt.timedelta(days=START_DOY - 1)
-DAYS_INFO = [
-    {
-        "doy": START_DOY + i,
-        "label": (BASE_DATE + dt.timedelta(days=i)).strftime("%Y-%m-%d"),
-    }
-    for i in range(END_DOY - START_DOY + 1)
-]
-DOY_TO_LABEL = {info["doy"]: info["label"] for info in DAYS_INFO}
-
-# Available date range in the dataset
-MIN_DATE = BASE_DATE
-MAX_DATE = BASE_DATE + dt.timedelta(days=END_DOY - START_DOY)
+# Asset naming convention produced by upload_to_gee.py:
+#   inundation_5bands_{YEAR}_{DAY_OF_YEAR}
+# e.g. inundation_5bands_2025_305
+ASSET_NAME_RE = re.compile(r"^inundation_5bands_(\d{4})_(\d{1,3})$")
 
 CENTER = [0, 0]
 ZOOM = 2
@@ -153,29 +139,105 @@ def ensure_ee():
         st.stop()
 
 
-def test_asset_access():
+@st.cache_data(ttl=600, show_spinner="Skanowanie dostepnych assetow w Earth Engine...")
+def discover_available_days(_ee_ready_marker=None):
+    """
+    List all assets in ASSET_FOLDER, parse names matching
+    inundation_5bands_{YEAR}_{DOY}, and return sorted info for
+    every day that is actually available (across any number of years).
+
+    A composite "day_key" (year * 1000 + doy) is used everywhere downstream
+    instead of the raw day-of-year, so that data spanning multiple years
+    never collides (e.g. 2020 doy 10 vs 2021 doy 10).
+    """
+    try:
+        asset_ids = []
+        page_token = None
+        while True:
+            params = {"parent": ASSET_FOLDER, "pageSize": 1000}
+            if page_token:
+                params["pageToken"] = page_token
+            listing = ee.data.listAssets(params)
+            asset_ids.extend(a["id"] for a in listing.get("assets", []))
+            page_token = listing.get("nextPageToken")
+            if not page_token:
+                break
+    except Exception as e:
+        return [], f"Nie udalo sie wylistowac assetow w {ASSET_FOLDER}: {e}"
+
+    days_info = []
+    for asset_id in asset_ids:
+        short_name = asset_id.split("/")[-1]
+        m = ASSET_NAME_RE.match(short_name)
+        if not m:
+            continue
+        year, doy = int(m.group(1)), int(m.group(2))
+        try:
+            date_obj = dt.date(year, 1, 1) + dt.timedelta(days=doy - 1)
+        except (ValueError, OverflowError):
+            continue
+        days_info.append(
+            {
+                "year": year,
+                "doy": doy,
+                "day_key": year * 1000 + doy,
+                "date": date_obj.isoformat(),
+                "asset_id": asset_id,
+            }
+        )
+
+    days_info.sort(key=lambda d: d["day_key"])
+    return days_info, None
+
+
+def test_asset_access(days_info):
     """
     Test whether the app can read one known asset.
     This helps separate IAM/auth errors from rendering errors.
     """
-    test_path = f"{ASSET_FOLDER}/inundation_5bands_{YEAR}_{START_DOY}"
+    if not days_info:
+        st.error(
+            f"Nie znaleziono zadnych assetow pasujacych do wzorca "
+            f"'inundation_5bands_{{YEAR}}_{{DOY}}' w folderze {ASSET_FOLDER}."
+        )
+        st.stop()
+
+    test_info = days_info[0]
+    test_path = test_info["asset_id"]
     try:
         img = ee.Image(test_path)
         info = img.getInfo()
         bands = [b.get("id", f"band_{i}") for i, b in enumerate(info.get("bands", []))]
-        st.success("Earth Engine initialized and test asset is readable.")
+        st.success(
+            f"Earth Engine initialized. Found {len(days_info)} available day(s), "
+            f"from {days_info[0]['date']} to {days_info[-1]['date']}."
+        )
         with st.expander("Debug: Earth Engine connection"):
             st.write("PROJECT_ID:", PROJECT_ID)
             st.write("ASSET_FOLDER:", ASSET_FOLDER)
             st.write("Test asset:", test_path)
             st.write("Bands:", bands)
+            st.write("Total days found:", len(days_info))
     except Exception as e:
         st.error(f"Asset access failed for {test_path}: {e}")
         st.stop()
 
 
 ensure_ee()
-test_asset_access()
+DAYS_INFO, discovery_error = discover_available_days()
+if discovery_error:
+    st.error(discovery_error)
+    st.stop()
+test_asset_access(DAYS_INFO)
+
+# Lookup helpers built from the discovered assets
+DAY_KEY_TO_INFO = {info["day_key"]: info for info in DAYS_INFO}
+DATE_TO_DAY_KEY = {dt.date.fromisoformat(info["date"]): info["day_key"] for info in DAYS_INFO}
+DAY_KEY_TO_LABEL = {info["day_key"]: info["date"] for info in DAYS_INFO}
+
+# Available date range in the dataset (spans all years found)
+MIN_DATE = dt.date.fromisoformat(DAYS_INFO[0]["date"])
+MAX_DATE = dt.date.fromisoformat(DAYS_INFO[-1]["date"])
 
 
 # ---------------------------------------------
@@ -183,13 +245,11 @@ test_asset_access()
 # ---------------------------------------------
 def build_inund_collection():
     """
-    Build image collection from all configured asset days.
+    Build image collection from all discovered asset days.
     """
     imgs = []
     for info in DAYS_INFO:
-        day = info["doy"]
-        path = f"{ASSET_FOLDER}/inundation_5bands_{YEAR}_{day}"
-        img = ee.Image(path).set("day", day)
+        img = ee.Image(info["asset_id"]).set("day_key", info["day_key"])
         imgs.append(img)
     return ee.ImageCollection(imgs)
 
@@ -273,19 +333,21 @@ def parse_date_range(date_value):
 
 
 def dates_to_doys(start_date, end_date):
+    """
+    Expand a calendar date range into the list of calendar dates, plus the
+    sorted list of "day_key" values that actually have a matching asset
+    (gaps in the data are simply skipped). Works across any number of years.
+    """
     selected_dates = []
     current_date = start_date
     while current_date <= end_date:
         selected_dates.append(current_date)
         current_date += dt.timedelta(days=1)
 
-    year_start = dt.date(YEAR, 1, 1)
-    doys = [
-        (d - year_start).days + 1
-        for d in selected_dates
-        if START_DOY <= (d - year_start).days + 1 <= END_DOY
+    day_keys = [
+        DATE_TO_DAY_KEY[d] for d in selected_dates if d in DATE_TO_DAY_KEY
     ]
-    return selected_dates, sorted(doys)
+    return selected_dates, sorted(day_keys)
 
 
 # ---------------------------------------------
@@ -296,7 +358,7 @@ def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
     Compute pixel-wise mean image over selected days after masking.
     """
     ic = get_collection(kind)
-    ic_sel = ic.filter(ee.Filter.inList("day", selected_days))
+    ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
 
     size = ic_sel.size().getInfo()
     if size == 0:
@@ -618,7 +680,7 @@ def compute_region_ts_for_bbox(
         return int(val)
 
     for day in sorted(selected_days):
-        img = ic.filter(ee.Filter.eq("day", day)).first()
+        img = ic.filter(ee.Filter.eq("day_key", day)).first()
 
         if kind == "inundation":
             img_thr = mask_inund_band(img, band_index, thr_min, thr_max)
@@ -638,7 +700,7 @@ def compute_region_ts_for_bbox(
 
         results.append(
             {
-                "date": DOY_TO_LABEL.get(day, str(day)),
+                "date": DAY_KEY_TO_LABEL.get(day, str(day)),
                 "min": vmin,
                 "max": vmax,
                 "mean": vmean,
@@ -669,7 +731,7 @@ def compute_region_summary_for_bbox(
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
 
     ic = get_collection(kind)
-    ic_sel = ic.filter(ee.Filter.inList("day", selected_days))
+    ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
 
     # Use decoded values for anomaly bands before thresholding/statistics.
     ic_proc = ic_sel.map(lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max))
@@ -716,7 +778,7 @@ def compute_region_pixel_count(
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
 
     ic = get_collection(kind)
-    ic_sel = ic.filter(ee.Filter.inList("day", selected_days))
+    ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
 
     if kind == "inundation":
 
