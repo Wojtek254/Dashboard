@@ -361,23 +361,51 @@ def dates_to_doys(start_date, end_date):
 # ---------------------------------------------
 # BUILD MEAN IMAGE FOR MAP DISPLAY
 # ---------------------------------------------
-def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
+@st.cache_resource(show_spinner=False)
+def build_mean_image(selected_days_tuple, thr_min, thr_max, kind, band_index):
     """
     Compute pixel-wise mean image over selected days after masking.
+
+    Cached with st.cache_resource for two reasons:
+    1. When both the shading layer AND the contour layer reference the same
+       CYGNSS band (a common combination), this used to be rebuilt twice
+       independently for the same tile request. Caching means the second
+       call is instant and EE only has to evaluate the mean once.
+    2. It also survives across reruns triggered by unrelated changes
+       (e.g. only the SECONDARY panel's settings changed), so the MAIN
+       panel's image doesn't get rebuilt from scratch every time.
     """
+    selected_days = list(selected_days_tuple)
+    if not selected_days:
+        # Cheap client-side check - selected_days already only ever contains
+        # day_keys known to exist locally (DAY_KEY_TO_INFO), so this needs
+        # no round-trip to Earth Engine at all.
+        raise ValueError("No images found for selected days: []")
+
     ic = get_collection(kind)
     ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
-
-    size = ic_sel.size().getInfo()
-    if size == 0:
-        raise ValueError(f"No images found for selected days: {selected_days}")
 
     # This uses real values for all bands. For anomaly bands (4/5),
     # the encoded +100 offset is removed before thresholding.
     ic_proc = ic_sel.map(lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max))
 
-    stacked = ic_proc.toBands()
-    pixel_mean = stacked.reduce(ee.Reducer.mean())
+    # NOTE: previously this used ic_proc.toBands() (turning every single
+    # selected day into its own band of one giant image) followed by
+    # .reduce(mean()). For a multi-year selection that means thousands of
+    # bands get enumerated and evaluated for every single map tile the
+    # browser requests. ImageCollection.reduce(mean()) computes the exact
+    # same pixel-wise mean natively/lazily without that enumeration step,
+    # which is dramatically cheaper to render as map tiles.
+    pixel_mean = ic_proc.reduce(ee.Reducer.mean())
+
+    # Pin the computation to a fixed ~3km grid (matching the scale already
+    # used for region statistics elsewhere in the app) BEFORE visualizing.
+    # Without this, every map tile request can force EE to re-average the
+    # full selected date range at whatever resolution the current zoom
+    # level implies, which is the main remaining cost when many days are
+    # selected. Reprojecting once caps that cost regardless of zoom level.
+    pixel_mean = pixel_mean.reproject(crs="EPSG:4326", scale=3000)
+
     return pixel_mean
 
 
@@ -463,7 +491,7 @@ def build_cygnss_image(layer_name, selected_days, thr_min, thr_max, mode="shadin
     kind = band_kind(band_number)
     band_index = band_number - 1
 
-    img = build_mean_image(selected_days, thr_min, thr_max, kind, band_index)
+    img = build_mean_image(tuple(selected_days), thr_min, thr_max, kind, band_index)
     vis = cygnss_legend(layer_name, thr_min, thr_max)
 
     if mode == "contour":
@@ -600,6 +628,42 @@ def build_side_visual_image(
         base = base.blend(contour)
 
     return base
+
+
+@st.cache_data(show_spinner=False)
+def get_tile_url_for_side(
+    selected_days_tuple,
+    thr_min,
+    thr_max,
+    start_date,
+    end_date,
+    shading_layer,
+    contour_layer,
+):
+    """
+    Build the visual EE image for one side of the map AND resolve it to a
+    tile URL (via getMapId, a network call) in one cached step.
+
+    WHY THIS MATTERS: st_folium reruns the whole Streamlit script on almost
+    every map interaction (pan, zoom, draw). Without this cache, every one
+    of those reruns rebuilt the EE image graph AND made a fresh getMapId()
+    network request - even though the user only moved the map and none of
+    the actual data/threshold/layer selections changed. Caching on the real
+    analysis parameters means panning/zooming hits the cache and costs
+    ~nothing, and a genuine recompute only happens when selection changes.
+    """
+    selected_days = list(selected_days_tuple)
+    visual_image = build_side_visual_image(
+        selected_days=selected_days,
+        thr_min=thr_min,
+        thr_max=thr_max,
+        start_date=start_date,
+        end_date=end_date,
+        shading_layer=shading_layer,
+        contour_layer=contour_layer,
+    )
+    map_id = visual_image.getMapId({})
+    return map_id["tile_fetcher"].url_format
 
 
 def selected_cygnss_layer(shading_layer, contour_layer):
@@ -739,8 +803,7 @@ def compute_region_summary_for_bbox(
     # Use decoded values for anomaly bands before thresholding/statistics.
     ic_proc = ic_sel.map(lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max))
 
-    stacked = ic_proc.toBands()
-    pixel_mean = stacked.reduce(ee.Reducer.mean())
+    pixel_mean = ic_proc.reduce(ee.Reducer.mean())
 
     # One combined reducer -> one getInfo() call instead of three.
     combined_reducer = ee.Reducer.minMax().combine(ee.Reducer.mean(), sharedInputs=True)
@@ -904,12 +967,12 @@ def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, position, bot
 
 
 def build_map(
-    left_visual_image,
+    left_tile_url,
     left_label,
     saved_feature=None,
     map_center=None,
     map_zoom=None,
-    right_visual_image=None,
+    right_tile_url=None,
     right_label=None,
     left_shading_layer="none",
     left_contour_layer="none",
@@ -928,9 +991,6 @@ def build_map(
 
         m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
 
-        left_map_id = left_visual_image.getMapId({})
-        left_tile_url = left_map_id["tile_fetcher"].url_format
-
         left_layer = folium.TileLayer(
             tiles=left_tile_url,
             attr="Google Earth Engine",
@@ -940,10 +1000,7 @@ def build_map(
         )
         left_layer.add_to(m)
 
-        if right_visual_image is not None:
-            right_map_id = right_visual_image.getMapId({})
-            right_tile_url = right_map_id["tile_fetcher"].url_format
-
+        if right_tile_url is not None:
             if right_label is None:
                 right_label = "SECONDARY layer"
 
@@ -997,7 +1054,7 @@ def build_map(
             position="left", bottom="260px", role="contour"
         )
 
-        if right_visual_image is not None:
+        if right_tile_url is not None:
             add_layer_colorbar(
                 m, "SECONDARY", right_shading_layer, right_thr_min, right_thr_max,
                 position="right", bottom="40px", role="shading"
@@ -1490,8 +1547,8 @@ if split_view and right_start_date is not None:
 # BUILD IMAGES FOR MAP
 # ---------------------------------------------
 try:
-    left_visual_image = build_side_visual_image(
-        selected_days=left_sel_days,
+    left_tile_url = get_tile_url_for_side(
+        selected_days_tuple=tuple(left_sel_days),
         thr_min=left_thr_min,
         thr_max=left_thr_max,
         start_date=left_start_date,
@@ -1503,11 +1560,11 @@ except Exception as e:
     st.error(f"Failed to build MAIN image: {e}")
     st.stop()
 
-right_visual_image = None
+right_tile_url = None
 if split_view and right_sel_days is not None:
     try:
-        right_visual_image = build_side_visual_image(
-            selected_days=right_sel_days,
+        right_tile_url = get_tile_url_for_side(
+            selected_days_tuple=tuple(right_sel_days),
             thr_min=right_thr_min,
             thr_max=right_thr_max,
             start_date=right_start_date,
@@ -1523,12 +1580,12 @@ if split_view and right_sel_days is not None:
 # BUILD / DISPLAY MAP
 # ---------------------------------------------
 m = build_map(
-    left_visual_image=left_visual_image,
+    left_tile_url=left_tile_url,
     left_label=left_label,
     saved_feature=st.session_state.saved_feature,
     map_center=st.session_state.map_center,
     map_zoom=st.session_state.map_zoom,
-    right_visual_image=right_visual_image,
+    right_tile_url=right_tile_url,
     right_label=right_label,
     left_shading_layer=left_shading_layer,
     left_contour_layer=left_contour_layer,
