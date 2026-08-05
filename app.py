@@ -35,8 +35,8 @@ ASSET_FOLDER = f"projects/{PROJECT_ID}/assets"
 # e.g. inundation_5bands_2025_305
 ASSET_NAME_RE = re.compile(r"^inundation_5bands_(\d{4})_(\d{1,3})$")
 
-CENTER = [0.5, 101.5]  # Sumatra, Indonesia - default starting view
-ZOOM = 6
+CENTER = [0, 0]
+ZOOM = 2
 
 # Color palette for inundation
 PALETTE_INUND = [
@@ -123,17 +123,10 @@ def band_kind(band_number: int) -> str:
 # ---------------------------------------------
 # INITIALIZE GOOGLE EARTH ENGINE
 # ---------------------------------------------
-@st.cache_resource(show_spinner=False)
 def ensure_ee():
     """
     Initialize Earth Engine using service account credentials
     stored in Streamlit secrets.
-
-    Cached with st.cache_resource: without this, ee.Initialize() (which
-    builds credentials and opens an EE session) ran again from scratch on
-    every single Streamlit rerun - i.e. on every map pan/zoom/draw, not
-    just on first load. Caching means the session is built once per app
-    process and reused across reruns.
     """
     try:
         credentials = service_account.Credentials.from_service_account_info(
@@ -141,7 +134,6 @@ def ensure_ee():
             scopes=["https://www.googleapis.com/auth/earthengine"],
         )
         ee.Initialize(credentials=credentials, project=PROJECT_ID)
-        return True
     except Exception as e:
         st.error(f"Earth Engine initialization failed: {e}")
         st.stop()
@@ -236,14 +228,7 @@ DAYS_INFO, discovery_error = discover_available_days()
 if discovery_error:
     st.error(discovery_error)
     st.stop()
-
-# test_asset_access() makes a live ee.Image.getInfo() network call. It only
-# needs to confirm access once per session (or when the discovered asset
-# list actually changes) - not on every rerun triggered by a map pan/zoom
-# or a widget change.
-if st.session_state.get("asset_access_checked_for") != len(DAYS_INFO):
-    test_asset_access(DAYS_INFO)
-    st.session_state["asset_access_checked_for"] = len(DAYS_INFO)
+test_asset_access(DAYS_INFO)
 
 # Lookup helpers built from the discovered assets
 DAY_KEY_TO_INFO = {info["day_key"]: info for info in DAYS_INFO}
@@ -688,7 +673,7 @@ def selected_cygnss_layer(shading_layer, contour_layer):
     if is_cygnss_layer(contour_layer):
         return contour_layer
     return None
-# COMBINED REGION STATISTICS (CACHE)
+# TIME SERIES FOR AREA (CACHE)
 # ---------------------------------------------
 @st.cache_data
 def compute_region_ts_for_bbox(
@@ -703,10 +688,21 @@ def compute_region_ts_for_bbox(
     band_index,
 ):
     """
-    Per-day min/max/mean/count_inrange/count_total time series for the
-    drawn region, built as a single server-side ee.FeatureCollection and
-    resolved with exactly ONE getInfo() call regardless of how many days
-    are selected.
+    Compute the per-day min/max/mean/count_inrange/count_total time series
+    for the drawn region.
+
+    IMPORTANT PERFORMANCE NOTE:
+    The previous version looped over each selected day in Python and issued
+    5 separate .getInfo() calls per day (min, max, mean, count_inrange,
+    count_total) - i.e. N days * 5 network round-trips to Earth Engine.
+    For a multi-week or multi-year selection that is the main reason the
+    app feels like it "grinds" through data.
+
+    This version instead builds the entire per-day computation as a single
+    server-side ee.ImageCollection.map(...) -> ee.FeatureCollection, and
+    calls .getInfo() exactly ONCE at the end, regardless of how many days
+    are selected. All min/max/mean/count_inrange values also come from one
+    combined reducer per image instead of 3-4 separate reducers.
     """
     selected_days = list(selected_days_tuple)
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
@@ -754,6 +750,8 @@ def compute_region_ts_for_bbox(
         )
 
     fc = ee.FeatureCollection(ic_sel.map(per_image_feature))
+
+    # Single network round-trip for the whole selected period.
     raw_features = fc.getInfo().get("features", [])
 
     results = []
@@ -781,8 +779,11 @@ def compute_region_ts_for_bbox(
     return results
 
 
+# ---------------------------------------------
+# SUMMARY STATS FOR MEAN IMAGE OVER AREA (CACHE)
+# ---------------------------------------------
 @st.cache_data
-def compute_region_summary_and_counts_for_bbox(
+def compute_region_summary_for_bbox(
     selected_days_tuple,
     thr_min,
     thr_max,
@@ -793,33 +794,59 @@ def compute_region_summary_and_counts_for_bbox(
     kind,
     band_index,
 ):
-    """
-    Whole-period summary (min/max/mean of the mean image) AND whole-period
-    pixel counts (ever-valid / ever-in-range), combined into a single
-    ee.Dictionary of plain reduceRegion() outputs and resolved with ONE
-    getInfo() call - two round-trips saved vs. computing them separately,
-    without mixing in a FeatureCollection (kept in its own call in
-    compute_region_ts_for_bbox, since that combination is less standard
-    and safer kept separate).
-    """
     selected_days = list(selected_days_tuple)
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
 
     ic = get_collection(kind)
     ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
 
-    # --- whole-period summary over the mean image ---
+    # Use decoded values for anomaly bands before thresholding/statistics.
     ic_proc = ic_sel.map(lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max))
+
     pixel_mean = ic_proc.reduce(ee.Reducer.mean())
-    summary_reducer = ee.Reducer.minMax().combine(ee.Reducer.mean(), sharedInputs=True)
-    summary_stats = pixel_mean.reduceRegion(
-        reducer=summary_reducer,
+
+    # One combined reducer -> one getInfo() call instead of three.
+    combined_reducer = ee.Reducer.minMax().combine(ee.Reducer.mean(), sharedInputs=True)
+    stats = pixel_mean.reduceRegion(
+        reducer=combined_reducer,
         geometry=region,
         scale=3000,
         maxPixels=1e13,
-    )
+    ).getInfo()
 
-    # --- whole-period pixel counts (ever-valid / ever-in-range) ---
+    if not stats:
+        return None, None, None
+
+    rmin = stats.get("mean_min")
+    rmax = stats.get("mean_max")
+    rmean = stats.get("mean_mean")
+    rmin = float(rmin) if rmin is not None else None
+    rmax = float(rmax) if rmax is not None else None
+    rmean = float(rmean) if rmean is not None else None
+    return rmin, rmax, rmean
+
+
+# ---------------------------------------------
+# PIXEL COUNTS FOR SELECTED PERIOD (CACHE)
+# ---------------------------------------------
+@st.cache_data
+def compute_region_pixel_count(
+    selected_days_tuple,
+    thr_min,
+    thr_max,
+    xmin,
+    ymin,
+    xmax,
+    ymax,
+    kind,
+    band_index,
+):
+    selected_days = list(selected_days_tuple)
+    region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
+
+    ic = get_collection(kind)
+    ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
+
     if kind == "inundation":
 
         def valid_mask(img):
@@ -844,43 +871,23 @@ def compute_region_summary_and_counts_for_bbox(
     inrange_any = ic_sel.map(inrange_mask).max()
 
     d_tot = valid_any.reduceRegion(
-        reducer=ee.Reducer.sum(), geometry=region, scale=3000, maxPixels=1e13,
-    )
+        reducer=ee.Reducer.sum(),
+        geometry=region,
+        scale=3000,
+        maxPixels=1e13,
+    ).getInfo()
+
     d_in = inrange_any.reduceRegion(
-        reducer=ee.Reducer.sum(), geometry=region, scale=3000, maxPixels=1e13,
-    )
+        reducer=ee.Reducer.sum(),
+        geometry=region,
+        scale=3000,
+        maxPixels=1e13,
+    ).getInfo()
 
-    combined = ee.Dictionary(
-        {
-            "summary": summary_stats,
-            "count_total": d_tot,
-            "count_in": d_in,
-        }
-    )
-    result = combined.getInfo()
+    total_count = int(list(d_tot.values())[0]) if d_tot and list(d_tot.values())[0] is not None else 0
+    in_range_count = int(list(d_in.values())[0]) if d_in and list(d_in.values())[0] is not None else 0
 
-    summary = result.get("summary") or {}
-    rmin = summary.get("mean_min")
-    rmax = summary.get("mean_max")
-    rmean = summary.get("mean_mean")
-    rmin = float(rmin) if rmin is not None else None
-    rmax = float(rmax) if rmax is not None else None
-    rmean = float(rmean) if rmean is not None else None
-
-    d_tot_result = result.get("count_total") or {}
-    d_in_result = result.get("count_in") or {}
-    total_count = (
-        int(list(d_tot_result.values())[0])
-        if d_tot_result and list(d_tot_result.values())[0] is not None
-        else 0
-    )
-    in_range_count = (
-        int(list(d_in_result.values())[0])
-        if d_in_result and list(d_in_result.values())[0] is not None
-        else 0
-    )
-
-    return (rmin, rmax, rmean), (in_range_count, total_count)
+    return in_range_count, total_count
 
 
 # ---------------------------------------------
@@ -959,33 +966,10 @@ def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, position, bot
     )
 
 
-def build_selected_region_feature_group(saved_feature):
-    """
-    Build the "selected region" overlay as a standalone FeatureGroup instead
-    of baking it into the static map. Passed to st_folium via
-    feature_group_to_add=, which updates it on the frontend WITHOUT
-    remounting the whole Leaflet map - so it no longer wipes out an
-    in-progress or just-finished hand-drawn rectangle.
-    """
-    if saved_feature is None:
-        return None
-
-    fg = folium.FeatureGroup(name="Selected region")
-    folium.GeoJson(
-        saved_feature,
-        style_function=lambda x: {
-            "color": "#ff8800",
-            "weight": 2,
-            "fillColor": "#ff8800",
-            "fillOpacity": 0.15,
-        },
-    ).add_to(fg)
-    return fg
-
-
 def build_map(
     left_tile_url,
     left_label,
+    saved_feature=None,
     map_center=None,
     map_zoom=None,
     right_tile_url=None,
@@ -1049,15 +1033,17 @@ def build_map(
             edit_options={"edit": True, "remove": True},
         ).add_to(m)
 
-        # NOTE: the "selected region" overlay used to be baked into this
-        # static folium.Map object via folium.GeoJson(...).add_to(m). That
-        # meant every time a rectangle was drawn/saved, this function
-        # produced a DIFFERENT map object than the previous rerun, which
-        # forced st_folium to fully remount the Leaflet map on the frontend
-        # - wiping out the live drawing layer in the process (the drawn
-        # rectangle "disappearing"). It is now added dynamically after the
-        # fact via st_folium's feature_group_to_add=, which updates the
-        # map without remounting it. See build_selected_region_feature_group().
+        if saved_feature is not None:
+            folium.GeoJson(
+                saved_feature,
+                name="Selected region",
+                style_function=lambda x: {
+                    "color": "#ff8800",
+                    "weight": 2,
+                    "fillColor": "#ff8800",
+                    "fillOpacity": 0.15,
+                },
+            ).add_to(m)
 
         add_layer_colorbar(
             m, "MAIN", left_shading_layer, left_thr_min, left_thr_max,
@@ -1596,6 +1582,7 @@ if split_view and right_sel_days is not None:
 m = build_map(
     left_tile_url=left_tile_url,
     left_label=left_label,
+    saved_feature=st.session_state.saved_feature,
     map_center=st.session_state.map_center,
     map_zoom=st.session_state.map_zoom,
     right_tile_url=right_tile_url,
@@ -1610,26 +1597,20 @@ m = build_map(
     right_thr_max=right_thr_max,
 )
 
-selected_region_fg = build_selected_region_feature_group(st.session_state.saved_feature)
-
-# returned_objects limits BOTH what comes back AND what can trigger a
-# Streamlit rerun: panning/zooming used to be included by default, so
-# almost every map movement caused a full script rerun. Restricting this
-# to only the drawing-related keys means panning/zooming now happens
-# purely client-side (no rerun) and only finishing/editing a rectangle
-# triggers one. Combined with feature_group_to_add= (dynamic update, no
-# remount) and center=/zoom= (dynamic reposition, no remount) below, a
-# completed drawing survives the resulting rerun instead of vanishing.
 map_state = st_folium(
     m,
     height=650,
     width=None,
     key="cygnss_map",
-    center=st.session_state.map_center,
-    zoom=st.session_state.map_zoom,
-    feature_group_to_add=selected_region_fg,
-    returned_objects=["last_active_drawing", "all_drawings"],
 )
+
+if map_state is not None:
+    if map_state.get("center") is not None:
+        center_dict = map_state["center"]
+        st.session_state.map_center = [center_dict["lat"], center_dict["lng"]]
+
+    if map_state.get("zoom") is not None:
+        st.session_state.map_zoom = map_state["zoom"]
 
 current_feature = extract_feature_from_map_state(map_state)
 
@@ -1670,19 +1651,30 @@ else:
             xmin, xmax = min(lons), max(lons)
             ymin, ymax = min(lats), max(lats)
 
-            (user_min, user_max, user_mean), (pixel_count_inrange, pixel_count_total) = (
-                compute_region_summary_and_counts_for_bbox(
-                    left_sel_days_tuple,
-                    left_thr_min,
-                    left_thr_max,
-                    xmin,
-                    ymin,
-                    xmax,
-                    ymax,
-                    stats_kind,
-                    stats_band_index,
-                )
+            user_min, user_max, user_mean = compute_region_summary_for_bbox(
+                left_sel_days_tuple,
+                left_thr_min,
+                left_thr_max,
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                stats_kind,
+                stats_band_index,
             )
+
+            pixel_count_inrange, pixel_count_total = compute_region_pixel_count(
+                left_sel_days_tuple,
+                left_thr_min,
+                left_thr_max,
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                stats_kind,
+                stats_band_index,
+            )
+
             region_ts = compute_region_ts_for_bbox(
                 left_sel_days_tuple,
                 left_thr_min,
