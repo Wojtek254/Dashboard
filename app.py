@@ -243,26 +243,18 @@ MAX_DATE = dt.date.fromisoformat(DAYS_INFO[-1]["date"])
 # ---------------------------------------------
 # IMAGE COLLECTIONS
 # ---------------------------------------------
-@st.cache_resource(ttl=600, show_spinner="Budowanie kolekcji obrazow Earth Engine...")
-def build_inund_collection(days_info_tuple):
+def build_inund_collection():
     """
     Build image collection from all discovered asset days.
-
-    Cached with st.cache_resource (not cache_data) because ee.* objects
-    are not meant to be pickled/serialized - cache_resource keeps a single
-    live Python object across reruns instead of rebuilding it every time
-    the script re-executes (which happens on every widget interaction).
-    The ttl matches discover_available_days() so a rebuild only happens
-    when the underlying asset list is actually refreshed/changed.
     """
     imgs = []
-    for info in days_info_tuple:
+    for info in DAYS_INFO:
         img = ee.Image(info["asset_id"]).set("day_key", info["day_key"])
         imgs.append(img)
     return ee.ImageCollection(imgs)
 
 
-IC_INUND = build_inund_collection(tuple(DAYS_INFO))
+IC_INUND = build_inund_collection()
 
 
 def get_collection(kind: str):
@@ -361,51 +353,23 @@ def dates_to_doys(start_date, end_date):
 # ---------------------------------------------
 # BUILD MEAN IMAGE FOR MAP DISPLAY
 # ---------------------------------------------
-@st.cache_resource(show_spinner=False)
-def build_mean_image(selected_days_tuple, thr_min, thr_max, kind, band_index):
+def build_mean_image(selected_days, thr_min, thr_max, kind, band_index):
     """
     Compute pixel-wise mean image over selected days after masking.
-
-    Cached with st.cache_resource for two reasons:
-    1. When both the shading layer AND the contour layer reference the same
-       CYGNSS band (a common combination), this used to be rebuilt twice
-       independently for the same tile request. Caching means the second
-       call is instant and EE only has to evaluate the mean once.
-    2. It also survives across reruns triggered by unrelated changes
-       (e.g. only the SECONDARY panel's settings changed), so the MAIN
-       panel's image doesn't get rebuilt from scratch every time.
     """
-    selected_days = list(selected_days_tuple)
-    if not selected_days:
-        # Cheap client-side check - selected_days already only ever contains
-        # day_keys known to exist locally (DAY_KEY_TO_INFO), so this needs
-        # no round-trip to Earth Engine at all.
-        raise ValueError("No images found for selected days: []")
-
     ic = get_collection(kind)
     ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
+
+    size = ic_sel.size().getInfo()
+    if size == 0:
+        raise ValueError(f"No images found for selected days: {selected_days}")
 
     # This uses real values for all bands. For anomaly bands (4/5),
     # the encoded +100 offset is removed before thresholding.
     ic_proc = ic_sel.map(lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max))
 
-    # NOTE: previously this used ic_proc.toBands() (turning every single
-    # selected day into its own band of one giant image) followed by
-    # .reduce(mean()). For a multi-year selection that means thousands of
-    # bands get enumerated and evaluated for every single map tile the
-    # browser requests. ImageCollection.reduce(mean()) computes the exact
-    # same pixel-wise mean natively/lazily without that enumeration step,
-    # which is dramatically cheaper to render as map tiles.
-    pixel_mean = ic_proc.reduce(ee.Reducer.mean())
-
-    # Pin the computation to a fixed ~3km grid (matching the scale already
-    # used for region statistics elsewhere in the app) BEFORE visualizing.
-    # Without this, every map tile request can force EE to re-average the
-    # full selected date range at whatever resolution the current zoom
-    # level implies, which is the main remaining cost when many days are
-    # selected. Reprojecting once caps that cost regardless of zoom level.
-    pixel_mean = pixel_mean.reproject(crs="EPSG:4326", scale=3000)
-
+    stacked = ic_proc.toBands()
+    pixel_mean = stacked.reduce(ee.Reducer.mean())
     return pixel_mean
 
 
@@ -491,7 +455,7 @@ def build_cygnss_image(layer_name, selected_days, thr_min, thr_max, mode="shadin
     kind = band_kind(band_number)
     band_index = band_number - 1
 
-    img = build_mean_image(tuple(selected_days), thr_min, thr_max, kind, band_index)
+    img = build_mean_image(selected_days, thr_min, thr_max, kind, band_index)
     vis = cygnss_legend(layer_name, thr_min, thr_max)
 
     if mode == "contour":
@@ -630,42 +594,6 @@ def build_side_visual_image(
     return base
 
 
-@st.cache_data(show_spinner=False)
-def get_tile_url_for_side(
-    selected_days_tuple,
-    thr_min,
-    thr_max,
-    start_date,
-    end_date,
-    shading_layer,
-    contour_layer,
-):
-    """
-    Build the visual EE image for one side of the map AND resolve it to a
-    tile URL (via getMapId, a network call) in one cached step.
-
-    WHY THIS MATTERS: st_folium reruns the whole Streamlit script on almost
-    every map interaction (pan, zoom, draw). Without this cache, every one
-    of those reruns rebuilt the EE image graph AND made a fresh getMapId()
-    network request - even though the user only moved the map and none of
-    the actual data/threshold/layer selections changed. Caching on the real
-    analysis parameters means panning/zooming hits the cache and costs
-    ~nothing, and a genuine recompute only happens when selection changes.
-    """
-    selected_days = list(selected_days_tuple)
-    visual_image = build_side_visual_image(
-        selected_days=selected_days,
-        thr_min=thr_min,
-        thr_max=thr_max,
-        start_date=start_date,
-        end_date=end_date,
-        shading_layer=shading_layer,
-        contour_layer=contour_layer,
-    )
-    map_id = visual_image.getMapId({})
-    return map_id["tile_fetcher"].url_format
-
-
 def selected_cygnss_layer(shading_layer, contour_layer):
     """Return the first CYGNSS layer selected on a side, used for statistics."""
     if is_cygnss_layer(shading_layer):
@@ -687,95 +615,100 @@ def compute_region_ts_for_bbox(
     kind,
     band_index,
 ):
-    """
-    Compute the per-day min/max/mean/count_inrange/count_total time series
-    for the drawn region.
-
-    IMPORTANT PERFORMANCE NOTE:
-    The previous version looped over each selected day in Python and issued
-    5 separate .getInfo() calls per day (min, max, mean, count_inrange,
-    count_total) - i.e. N days * 5 network round-trips to Earth Engine.
-    For a multi-week or multi-year selection that is the main reason the
-    app feels like it "grinds" through data.
-
-    This version instead builds the entire per-day computation as a single
-    server-side ee.ImageCollection.map(...) -> ee.FeatureCollection, and
-    calls .getInfo() exactly ONCE at the end, regardless of how many days
-    are selected. All min/max/mean/count_inrange values also come from one
-    combined reducer per image instead of 3-4 separate reducers.
-    """
     selected_days = list(selected_days_tuple)
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
+    results = []
 
     ic = get_collection(kind)
-    ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
 
-    combined_reducer = (
-        ee.Reducer.minMax()
-        .combine(ee.Reducer.mean(), sharedInputs=True)
-        .combine(ee.Reducer.count(), sharedInputs=True)
-    )
-
-    def per_image_feature(img):
-        if kind == "inundation":
-            img_thr = mask_inund_band(img, band_index, thr_min, thr_max)
-            band_valid = inund_valid_band(img, band_index)
-        else:
-            img_thr = anomaly_thresholded(img, band_index, thr_min, thr_max)
-            band_valid = anomaly_valid_band(img, band_index)
-
-        stats = img_thr.reduceRegion(
-            reducer=combined_reducer,
+    def region_stat(img, reducer):
+        d = img.reduceRegion(
+            reducer=reducer,
             geometry=region,
             scale=3000,
             maxPixels=1e13,
-        )
-        cnt_tot = band_valid.reduceRegion(
+        ).getInfo()
+        if not d:
+            return None
+        val = list(d.values())[0]
+        if val is None:
+            return None
+        return float(val)
+
+    def region_count_inrange(img_thr):
+        d = img_thr.reduceRegion(
             reducer=ee.Reducer.count(),
             geometry=region,
             scale=3000,
             maxPixels=1e13,
-        )
+        ).getInfo()
+        if not d:
+            return 0
+        val = list(d.values())[0]
+        if val is None:
+            return 0
+        return int(val)
 
-        return ee.Feature(
-            None,
-            {
-                "day_key": img.get("day_key"),
-                "min": stats.get("value_min"),
-                "max": stats.get("value_max"),
-                "mean": stats.get("value_mean"),
-                "count_inrange": stats.get("value_count"),
-                "count_total": cnt_tot.values().get(0),
-            },
-        )
+    def region_count_total_inund(img):
+        band_valid = inund_valid_band(img, band_index)
+        d = band_valid.reduceRegion(
+            reducer=ee.Reducer.count(),
+            geometry=region,
+            scale=3000,
+            maxPixels=1e13,
+        ).getInfo()
+        if not d:
+            return 0
+        val = list(d.values())[0]
+        if val is None:
+            return 0
+        return int(val)
 
-    fc = ee.FeatureCollection(ic_sel.map(per_image_feature))
+    def region_count_total_anom(img):
+        band_valid = anomaly_valid_band(img, band_index)
+        d = band_valid.reduceRegion(
+            reducer=ee.Reducer.count(),
+            geometry=region,
+            scale=3000,
+            maxPixels=1e13,
+        ).getInfo()
+        if not d:
+            return 0
+        val = list(d.values())[0]
+        if val is None:
+            return 0
+        return int(val)
 
-    # Single network round-trip for the whole selected period.
-    raw_features = fc.getInfo().get("features", [])
+    for day in sorted(selected_days):
+        img = ic.filter(ee.Filter.eq("day_key", day)).first()
 
-    results = []
-    for f in raw_features:
-        props = f.get("properties", {})
-        day = props.get("day_key")
-        vmin = props.get("min")
-        vmax = props.get("max")
-        vmean = props.get("mean")
-        cnt_in = props.get("count_inrange")
-        cnt_tot = props.get("count_total")
+        if kind == "inundation":
+            img_thr = mask_inund_band(img, band_index, thr_min, thr_max)
+            cnt_tot = region_count_total_inund(img)
+        else:
+            img_thr = anomaly_thresholded(img, band_index, thr_min, thr_max)
+            cnt_tot = region_count_total_anom(img)
+
+        vmin = region_stat(img_thr, ee.Reducer.min())
+        vmax = region_stat(img_thr, ee.Reducer.max())
+        vmean = region_stat(img_thr, ee.Reducer.mean())
+        cnt_in = region_count_inrange(img_thr)
+
+        vmin = vmin if vmin is not None else 0.0
+        vmax = vmax if vmax is not None else 0.0
+        vmean = vmean if vmean is not None else 0.0
 
         results.append(
             {
                 "date": DAY_KEY_TO_LABEL.get(day, str(day)),
-                "min": float(vmin) if vmin is not None else 0.0,
-                "max": float(vmax) if vmax is not None else 0.0,
-                "mean": float(vmean) if vmean is not None else 0.0,
-                "count_total": int(cnt_tot) if cnt_tot is not None else 0,
-                "count_inrange": int(cnt_in) if cnt_in is not None else 0,
+                "min": vmin,
+                "max": vmax,
+                "mean": vmean,
+                "count_total": cnt_tot,
+                "count_inrange": cnt_in,
             }
         )
 
-    results.sort(key=lambda r: r["date"])
     return results
 
 
@@ -803,26 +736,26 @@ def compute_region_summary_for_bbox(
     # Use decoded values for anomaly bands before thresholding/statistics.
     ic_proc = ic_sel.map(lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max))
 
-    pixel_mean = ic_proc.reduce(ee.Reducer.mean())
+    stacked = ic_proc.toBands()
+    pixel_mean = stacked.reduce(ee.Reducer.mean())
 
-    # One combined reducer -> one getInfo() call instead of three.
-    combined_reducer = ee.Reducer.minMax().combine(ee.Reducer.mean(), sharedInputs=True)
-    stats = pixel_mean.reduceRegion(
-        reducer=combined_reducer,
-        geometry=region,
-        scale=3000,
-        maxPixels=1e13,
-    ).getInfo()
+    def region_stat(img, reducer):
+        d = img.reduceRegion(
+            reducer=reducer,
+            geometry=region,
+            scale=3000,
+            maxPixels=1e13,
+        ).getInfo()
+        if not d:
+            return None
+        val = list(d.values())[0]
+        if val is None:
+            return None
+        return float(val)
 
-    if not stats:
-        return None, None, None
-
-    rmin = stats.get("mean_min")
-    rmax = stats.get("mean_max")
-    rmean = stats.get("mean_mean")
-    rmin = float(rmin) if rmin is not None else None
-    rmax = float(rmax) if rmax is not None else None
-    rmean = float(rmean) if rmean is not None else None
+    rmin = region_stat(pixel_mean, ee.Reducer.min())
+    rmax = region_stat(pixel_mean, ee.Reducer.max())
+    rmean = region_stat(pixel_mean, ee.Reducer.mean())
     return rmin, rmax, rmean
 
 
@@ -967,12 +900,12 @@ def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, position, bot
 
 
 def build_map(
-    left_tile_url,
+    left_visual_image,
     left_label,
     saved_feature=None,
     map_center=None,
     map_zoom=None,
-    right_tile_url=None,
+    right_visual_image=None,
     right_label=None,
     left_shading_layer="none",
     left_contour_layer="none",
@@ -991,6 +924,9 @@ def build_map(
 
         m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
 
+        left_map_id = left_visual_image.getMapId({})
+        left_tile_url = left_map_id["tile_fetcher"].url_format
+
         left_layer = folium.TileLayer(
             tiles=left_tile_url,
             attr="Google Earth Engine",
@@ -1000,7 +936,10 @@ def build_map(
         )
         left_layer.add_to(m)
 
-        if right_tile_url is not None:
+        if right_visual_image is not None:
+            right_map_id = right_visual_image.getMapId({})
+            right_tile_url = right_map_id["tile_fetcher"].url_format
+
             if right_label is None:
                 right_label = "SECONDARY layer"
 
@@ -1054,7 +993,7 @@ def build_map(
             position="left", bottom="260px", role="contour"
         )
 
-        if right_tile_url is not None:
+        if right_visual_image is not None:
             add_layer_colorbar(
                 m, "SECONDARY", right_shading_layer, right_thr_min, right_thr_max,
                 position="right", bottom="40px", role="shading"
@@ -1547,8 +1486,8 @@ if split_view and right_start_date is not None:
 # BUILD IMAGES FOR MAP
 # ---------------------------------------------
 try:
-    left_tile_url = get_tile_url_for_side(
-        selected_days_tuple=tuple(left_sel_days),
+    left_visual_image = build_side_visual_image(
+        selected_days=left_sel_days,
         thr_min=left_thr_min,
         thr_max=left_thr_max,
         start_date=left_start_date,
@@ -1560,11 +1499,11 @@ except Exception as e:
     st.error(f"Failed to build MAIN image: {e}")
     st.stop()
 
-right_tile_url = None
+right_visual_image = None
 if split_view and right_sel_days is not None:
     try:
-        right_tile_url = get_tile_url_for_side(
-            selected_days_tuple=tuple(right_sel_days),
+        right_visual_image = build_side_visual_image(
+            selected_days=right_sel_days,
             thr_min=right_thr_min,
             thr_max=right_thr_max,
             start_date=right_start_date,
@@ -1580,12 +1519,12 @@ if split_view and right_sel_days is not None:
 # BUILD / DISPLAY MAP
 # ---------------------------------------------
 m = build_map(
-    left_tile_url=left_tile_url,
+    left_visual_image=left_visual_image,
     left_label=left_label,
     saved_feature=st.session_state.saved_feature,
     map_center=st.session_state.map_center,
     map_zoom=st.session_state.map_zoom,
-    right_tile_url=right_tile_url,
+    right_visual_image=right_visual_image,
     right_label=right_label,
     left_shading_layer=left_shading_layer,
     left_contour_layer=left_contour_layer,
