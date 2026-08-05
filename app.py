@@ -946,10 +946,33 @@ def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, position, bot
     )
 
 
+def build_selected_region_feature_group(saved_feature):
+    """
+    Build the "selected region" overlay as a standalone FeatureGroup instead
+    of baking it into the static map. Passed to st_folium via
+    feature_group_to_add=, which updates it on the frontend WITHOUT
+    remounting the whole Leaflet map - so it no longer wipes out an
+    in-progress or just-finished hand-drawn rectangle.
+    """
+    if saved_feature is None:
+        return None
+
+    fg = folium.FeatureGroup(name="Selected region")
+    folium.GeoJson(
+        saved_feature,
+        style_function=lambda x: {
+            "color": "#ff8800",
+            "weight": 2,
+            "fillColor": "#ff8800",
+            "fillOpacity": 0.15,
+        },
+    ).add_to(fg)
+    return fg
+
+
 def build_map(
     left_tile_url,
     left_label,
-    saved_feature=None,
     map_center=None,
     map_zoom=None,
     right_tile_url=None,
@@ -1013,17 +1036,15 @@ def build_map(
             edit_options={"edit": True, "remove": True},
         ).add_to(m)
 
-        if saved_feature is not None:
-            folium.GeoJson(
-                saved_feature,
-                name="Selected region",
-                style_function=lambda x: {
-                    "color": "#ff8800",
-                    "weight": 2,
-                    "fillColor": "#ff8800",
-                    "fillOpacity": 0.15,
-                },
-            ).add_to(m)
+        # NOTE: the "selected region" overlay used to be baked into this
+        # static folium.Map object via folium.GeoJson(...).add_to(m). That
+        # meant every time a rectangle was drawn/saved, this function
+        # produced a DIFFERENT map object than the previous rerun, which
+        # forced st_folium to fully remount the Leaflet map on the frontend
+        # - wiping out the live drawing layer in the process (the drawn
+        # rectangle "disappearing"). It is now added dynamically after the
+        # fact via st_folium's feature_group_to_add=, which updates the
+        # map without remounting it. See build_selected_region_feature_group().
 
         add_layer_colorbar(
             m, "MAIN", left_shading_layer, left_thr_min, left_thr_max,
@@ -1562,7 +1583,6 @@ if split_view and right_sel_days is not None:
 m = build_map(
     left_tile_url=left_tile_url,
     left_label=left_label,
-    saved_feature=st.session_state.saved_feature,
     map_center=st.session_state.map_center,
     map_zoom=st.session_state.map_zoom,
     right_tile_url=right_tile_url,
@@ -1577,20 +1597,26 @@ m = build_map(
     right_thr_max=right_thr_max,
 )
 
+selected_region_fg = build_selected_region_feature_group(st.session_state.saved_feature)
+
+# returned_objects limits BOTH what comes back AND what can trigger a
+# Streamlit rerun: panning/zooming used to be included by default, so
+# almost every map movement caused a full script rerun. Restricting this
+# to only the drawing-related keys means panning/zooming now happens
+# purely client-side (no rerun) and only finishing/editing a rectangle
+# triggers one. Combined with feature_group_to_add= (dynamic update, no
+# remount) and center=/zoom= (dynamic reposition, no remount) below, a
+# completed drawing survives the resulting rerun instead of vanishing.
 map_state = st_folium(
     m,
     height=650,
     width=None,
     key="cygnss_map",
+    center=st.session_state.map_center,
+    zoom=st.session_state.map_zoom,
+    feature_group_to_add=selected_region_fg,
+    returned_objects=["last_active_drawing", "all_drawings"],
 )
-
-if map_state is not None:
-    if map_state.get("center") is not None:
-        center_dict = map_state["center"]
-        st.session_state.map_center = [center_dict["lat"], center_dict["lng"]]
-
-    if map_state.get("zoom") is not None:
-        st.session_state.map_zoom = map_state["zoom"]
 
 current_feature = extract_feature_from_map_state(map_state)
 
