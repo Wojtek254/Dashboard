@@ -123,10 +123,17 @@ def band_kind(band_number: int) -> str:
 # ---------------------------------------------
 # INITIALIZE GOOGLE EARTH ENGINE
 # ---------------------------------------------
+@st.cache_resource(show_spinner=False)
 def ensure_ee():
     """
     Initialize Earth Engine using service account credentials
     stored in Streamlit secrets.
+
+    Cached with st.cache_resource: without this, ee.Initialize() (which
+    builds credentials and opens an EE session) ran again from scratch on
+    every single Streamlit rerun - i.e. on every map pan/zoom/draw, not
+    just on first load. Caching means the session is built once per app
+    process and reused across reruns.
     """
     try:
         credentials = service_account.Credentials.from_service_account_info(
@@ -134,6 +141,7 @@ def ensure_ee():
             scopes=["https://www.googleapis.com/auth/earthengine"],
         )
         ee.Initialize(credentials=credentials, project=PROJECT_ID)
+        return True
     except Exception as e:
         st.error(f"Earth Engine initialization failed: {e}")
         st.stop()
@@ -228,7 +236,14 @@ DAYS_INFO, discovery_error = discover_available_days()
 if discovery_error:
     st.error(discovery_error)
     st.stop()
-test_asset_access(DAYS_INFO)
+
+# test_asset_access() makes a live ee.Image.getInfo() network call. It only
+# needs to confirm access once per session (or when the discovered asset
+# list actually changes) - not on every rerun triggered by a map pan/zoom
+# or a widget change.
+if st.session_state.get("asset_access_checked_for") != len(DAYS_INFO):
+    test_asset_access(DAYS_INFO)
+    st.session_state["asset_access_checked_for"] = len(DAYS_INFO)
 
 # Lookup helpers built from the discovered assets
 DAY_KEY_TO_INFO = {info["day_key"]: info for info in DAYS_INFO}
@@ -673,10 +688,10 @@ def selected_cygnss_layer(shading_layer, contour_layer):
     if is_cygnss_layer(contour_layer):
         return contour_layer
     return None
-# TIME SERIES FOR AREA (CACHE)
+# COMBINED REGION STATISTICS (CACHE)
 # ---------------------------------------------
 @st.cache_data
-def compute_region_ts_for_bbox(
+def compute_region_stats_combined_for_bbox(
     selected_days_tuple,
     thr_min,
     thr_max,
@@ -688,21 +703,17 @@ def compute_region_ts_for_bbox(
     band_index,
 ):
     """
-    Compute the per-day min/max/mean/count_inrange/count_total time series
-    for the drawn region.
+    Compute everything needed for the statistics panel - the per-day
+    min/max/mean/count time series, the whole-period summary (min/max/mean
+    of the mean image), and the whole-period pixel counts - in one shot.
 
     IMPORTANT PERFORMANCE NOTE:
-    The previous version looped over each selected day in Python and issued
-    5 separate .getInfo() calls per day (min, max, mean, count_inrange,
-    count_total) - i.e. N days * 5 network round-trips to Earth Engine.
-    For a multi-week or multi-year selection that is the main reason the
-    app feels like it "grinds" through data.
-
-    This version instead builds the entire per-day computation as a single
-    server-side ee.ImageCollection.map(...) -> ee.FeatureCollection, and
-    calls .getInfo() exactly ONCE at the end, regardless of how many days
-    are selected. All min/max/mean/count_inrange values also come from one
-    combined reducer per image instead of 3-4 separate reducers.
+    This used to be three separate cached functions (compute_region_ts_for_bbox,
+    compute_region_summary_for_bbox, compute_region_pixel_count), each ending
+    in its own .getInfo() call. Streamlit/Python calls those sequentially, so
+    every stats refresh paid for 3 full network round-trips to Earth Engine
+    back-to-back. Here all three computations are assembled server-side into
+    a single ee.Dictionary and resolved with exactly ONE getInfo() call.
     """
     selected_days = list(selected_days_tuple)
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
@@ -710,6 +721,7 @@ def compute_region_ts_for_bbox(
     ic = get_collection(kind)
     ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
 
+    # --- per-day time series ---
     combined_reducer = (
         ee.Reducer.minMax()
         .combine(ee.Reducer.mean(), sharedInputs=True)
@@ -751,102 +763,18 @@ def compute_region_ts_for_bbox(
 
     fc = ee.FeatureCollection(ic_sel.map(per_image_feature))
 
-    # Single network round-trip for the whole selected period.
-    raw_features = fc.getInfo().get("features", [])
-
-    results = []
-    for f in raw_features:
-        props = f.get("properties", {})
-        day = props.get("day_key")
-        vmin = props.get("min")
-        vmax = props.get("max")
-        vmean = props.get("mean")
-        cnt_in = props.get("count_inrange")
-        cnt_tot = props.get("count_total")
-
-        results.append(
-            {
-                "date": DAY_KEY_TO_LABEL.get(day, str(day)),
-                "min": float(vmin) if vmin is not None else 0.0,
-                "max": float(vmax) if vmax is not None else 0.0,
-                "mean": float(vmean) if vmean is not None else 0.0,
-                "count_total": int(cnt_tot) if cnt_tot is not None else 0,
-                "count_inrange": int(cnt_in) if cnt_in is not None else 0,
-            }
-        )
-
-    results.sort(key=lambda r: r["date"])
-    return results
-
-
-# ---------------------------------------------
-# SUMMARY STATS FOR MEAN IMAGE OVER AREA (CACHE)
-# ---------------------------------------------
-@st.cache_data
-def compute_region_summary_for_bbox(
-    selected_days_tuple,
-    thr_min,
-    thr_max,
-    xmin,
-    ymin,
-    xmax,
-    ymax,
-    kind,
-    band_index,
-):
-    selected_days = list(selected_days_tuple)
-    region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
-
-    ic = get_collection(kind)
-    ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
-
-    # Use decoded values for anomaly bands before thresholding/statistics.
+    # --- whole-period summary over the mean image ---
     ic_proc = ic_sel.map(lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max))
-
     pixel_mean = ic_proc.reduce(ee.Reducer.mean())
-
-    # One combined reducer -> one getInfo() call instead of three.
-    combined_reducer = ee.Reducer.minMax().combine(ee.Reducer.mean(), sharedInputs=True)
-    stats = pixel_mean.reduceRegion(
-        reducer=combined_reducer,
+    summary_reducer = ee.Reducer.minMax().combine(ee.Reducer.mean(), sharedInputs=True)
+    summary_stats = pixel_mean.reduceRegion(
+        reducer=summary_reducer,
         geometry=region,
         scale=3000,
         maxPixels=1e13,
-    ).getInfo()
+    )
 
-    if not stats:
-        return None, None, None
-
-    rmin = stats.get("mean_min")
-    rmax = stats.get("mean_max")
-    rmean = stats.get("mean_mean")
-    rmin = float(rmin) if rmin is not None else None
-    rmax = float(rmax) if rmax is not None else None
-    rmean = float(rmean) if rmean is not None else None
-    return rmin, rmax, rmean
-
-
-# ---------------------------------------------
-# PIXEL COUNTS FOR SELECTED PERIOD (CACHE)
-# ---------------------------------------------
-@st.cache_data
-def compute_region_pixel_count(
-    selected_days_tuple,
-    thr_min,
-    thr_max,
-    xmin,
-    ymin,
-    xmax,
-    ymax,
-    kind,
-    band_index,
-):
-    selected_days = list(selected_days_tuple)
-    region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
-
-    ic = get_collection(kind)
-    ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
-
+    # --- whole-period pixel counts (ever-valid / ever-in-range) ---
     if kind == "inundation":
 
         def valid_mask(img):
@@ -871,23 +799,75 @@ def compute_region_pixel_count(
     inrange_any = ic_sel.map(inrange_mask).max()
 
     d_tot = valid_any.reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=region,
-        scale=3000,
-        maxPixels=1e13,
-    ).getInfo()
-
+        reducer=ee.Reducer.sum(), geometry=region, scale=3000, maxPixels=1e13,
+    )
     d_in = inrange_any.reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=region,
-        scale=3000,
-        maxPixels=1e13,
-    ).getInfo()
+        reducer=ee.Reducer.sum(), geometry=region, scale=3000, maxPixels=1e13,
+    )
 
-    total_count = int(list(d_tot.values())[0]) if d_tot and list(d_tot.values())[0] is not None else 0
-    in_range_count = int(list(d_in.values())[0]) if d_in and list(d_in.values())[0] is not None else 0
+    # Bundle everything server-side and resolve with a single getInfo() call.
+    combined = ee.Dictionary(
+        {
+            "ts_features": fc,
+            "summary": summary_stats,
+            "count_total": d_tot,
+            "count_in": d_in,
+        }
+    )
+    result = combined.getInfo()
 
-    return in_range_count, total_count
+    # --- unpack time series ---
+    raw_features = (result.get("ts_features") or {}).get("features", [])
+    ts_results = []
+    for f in raw_features:
+        props = f.get("properties", {})
+        day = props.get("day_key")
+        vmin = props.get("min")
+        vmax = props.get("max")
+        vmean = props.get("mean")
+        cnt_in = props.get("count_inrange")
+        cnt_tot = props.get("count_total")
+
+        ts_results.append(
+            {
+                "date": DAY_KEY_TO_LABEL.get(day, str(day)),
+                "min": float(vmin) if vmin is not None else 0.0,
+                "max": float(vmax) if vmax is not None else 0.0,
+                "mean": float(vmean) if vmean is not None else 0.0,
+                "count_total": int(cnt_tot) if cnt_tot is not None else 0,
+                "count_inrange": int(cnt_in) if cnt_in is not None else 0,
+            }
+        )
+    ts_results.sort(key=lambda r: r["date"])
+
+    # --- unpack whole-period summary ---
+    summary = result.get("summary") or {}
+    rmin = summary.get("mean_min")
+    rmax = summary.get("mean_max")
+    rmean = summary.get("mean_mean")
+    rmin = float(rmin) if rmin is not None else None
+    rmax = float(rmax) if rmax is not None else None
+    rmean = float(rmean) if rmean is not None else None
+
+    # --- unpack whole-period pixel counts ---
+    d_tot_result = result.get("count_total") or {}
+    d_in_result = result.get("count_in") or {}
+    total_count = (
+        int(list(d_tot_result.values())[0])
+        if d_tot_result and list(d_tot_result.values())[0] is not None
+        else 0
+    )
+    in_range_count = (
+        int(list(d_in_result.values())[0])
+        if d_in_result and list(d_in_result.values())[0] is not None
+        else 0
+    )
+
+    return {
+        "region_ts": ts_results,
+        "summary": (rmin, rmax, rmean),
+        "pixel_counts": (in_range_count, total_count),
+    }
 
 
 # ---------------------------------------------
@@ -1651,7 +1631,7 @@ else:
             xmin, xmax = min(lons), max(lons)
             ymin, ymax = min(lats), max(lats)
 
-            user_min, user_max, user_mean = compute_region_summary_for_bbox(
+            combined_stats = compute_region_stats_combined_for_bbox(
                 left_sel_days_tuple,
                 left_thr_min,
                 left_thr_max,
@@ -1662,30 +1642,9 @@ else:
                 stats_kind,
                 stats_band_index,
             )
-
-            pixel_count_inrange, pixel_count_total = compute_region_pixel_count(
-                left_sel_days_tuple,
-                left_thr_min,
-                left_thr_max,
-                xmin,
-                ymin,
-                xmax,
-                ymax,
-                stats_kind,
-                stats_band_index,
-            )
-
-            region_ts = compute_region_ts_for_bbox(
-                left_sel_days_tuple,
-                left_thr_min,
-                left_thr_max,
-                xmin,
-                ymin,
-                xmax,
-                ymax,
-                stats_kind,
-                stats_band_index,
-            )
+            user_min, user_max, user_mean = combined_stats["summary"]
+            pixel_count_inrange, pixel_count_total = combined_stats["pixel_counts"]
+            region_ts = combined_stats["region_ts"]
 
             if any(v is None for v in (user_min, user_max, user_mean)) or pixel_count_total == 0:
                 st.info(
