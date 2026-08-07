@@ -608,7 +608,7 @@ def selected_cygnss_layer(shading_layer, contour_layer):
 # to crop/download the selected CYGNSS band for the user's rectangle. This
 # avoids running reduceRegion repeatedly for every day.
 STATS_SCALE_M = 3000
-DOWNLOAD_DAYS_PER_CHUNK = 20
+DOWNLOAD_DAYS_PER_CHUNK = 8
 
 
 def _download_ee_npy(image, region):
@@ -651,6 +651,42 @@ def _npy_to_band_arrays(arr, expected_count):
     return arrays
 
 
+def _download_day_arrays_adaptive(day_image_pairs, region):
+    """
+    Download a stack of days, automatically splitting the request when
+    Earth Engine rejects it (for example because the direct download is too large).
+
+    Returns a list of (day_key, 2-D numpy array) in the original order.
+    """
+    if not day_image_pairs:
+        return []
+
+    stack_img = ee.Image.cat([img for _, img in day_image_pairs]).clip(region)
+
+    try:
+        npy = _download_ee_npy(stack_img, region)
+        arrays = _npy_to_band_arrays(npy, len(day_image_pairs))
+        return [
+            (day, np.asarray(arr))
+            for (day, _), arr in zip(day_image_pairs, arrays)
+        ]
+    except Exception as exc:
+        if len(day_image_pairs) == 1:
+            day = day_image_pairs[0][0]
+            raise RuntimeError(
+                "Earth Engine could not download even a single-day raster for "
+                f"{DAY_KEY_TO_LABEL.get(day, day)} and the selected rectangle. "
+                "Try a smaller rectangle. The request may exceed Earth Engine's "
+                "direct-download limits."
+            ) from exc
+
+        mid = len(day_image_pairs) // 2
+        return (
+            _download_day_arrays_adaptive(day_image_pairs[:mid], region)
+            + _download_day_arrays_adaptive(day_image_pairs[mid:], region)
+        )
+
+
 @st.cache_data(show_spinner=False)
 def compute_region_stats_local(
     selected_days_tuple,
@@ -683,29 +719,32 @@ def compute_region_stats_local(
     daily_rows = []
 
     for chunk_start in range(0, len(selected_days), DOWNLOAD_DAYS_PER_CHUNK):
-        chunk_days = selected_days[chunk_start:chunk_start + DOWNLOAD_DAYS_PER_CHUNK]
+        chunk_days = selected_days[
+            chunk_start:chunk_start + DOWNLOAD_DAYS_PER_CHUNK
+        ]
 
-        images = []
+        day_image_pairs = []
         for day in chunk_days:
             info = DAY_KEY_TO_INFO.get(day)
             if info is None:
                 continue
-            images.append(
-                ee.Image(info["asset_id"])
-                .select(band_index)
-                .rename(f"d_{day}")
+            day_image_pairs.append(
+                (
+                    day,
+                    ee.Image(info["asset_id"])
+                    .select(band_index)
+                    .rename(f"d_{day}"),
+                )
             )
 
-        if not images:
+        if not day_image_pairs:
             continue
 
-        # The rectangle is applied before download, so only the small requested
-        # subset is transferred to the Streamlit server.
-        stack_img = ee.Image.cat(images).clip(region)
-        npy = _download_ee_npy(stack_img, region)
-        arrays = _npy_to_band_arrays(npy, len(images))
+        # Try the whole chunk first. If Earth Engine rejects it, split
+        # recursively until each request is small enough.
+        downloaded = _download_day_arrays_adaptive(day_image_pairs, region)
 
-        for day, raw in zip(chunk_days, arrays):
+        for day, raw in downloaded:
             raw = np.asarray(raw)
             valid = raw < 255
 
