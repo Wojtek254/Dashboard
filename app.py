@@ -1,11 +1,9 @@
 # app.py
-# pip install streamlit folium earthengine-api streamlit-folium pandas altair google-auth numpy
+# pip install streamlit folium earthengine-api streamlit-folium pandas altair google-auth
 
 import datetime as dt
 import io
 import re
-
-import numpy as np
 
 import altair as alt
 import ee
@@ -38,7 +36,7 @@ ASSET_FOLDER = f"projects/{PROJECT_ID}/assets"
 ASSET_NAME_RE = re.compile(r"^inundation_5bands_(\d{4})_(\d{1,3})$")
 
 CENTER = [0.5, 108.0]
-ZOOM = 6
+ZOOM = 4
 
 # Color palette for inundation
 PALETTE_INUND = [
@@ -601,16 +599,10 @@ def selected_cygnss_layer(shading_layer, contour_layer):
     if is_cygnss_layer(contour_layer):
         return contour_layer
     return None
-# LOCAL BBOX STATISTICS (CACHE)
+# TIME SERIES FOR AREA (CACHE)
 # ---------------------------------------------
-# Stable server-side implementation:
-# Earth Engine calculates all per-day regional statistics in one reduceRegion
-# per image. The whole daily table is then returned with a single getInfo().
-STATS_SCALE_M = 3000
-
-
-@st.cache_data(show_spinner=False)
-def compute_region_stats_local(
+@st.cache_data
+def compute_region_ts_for_bbox(
     selected_days_tuple,
     thr_min,
     thr_max,
@@ -622,207 +614,202 @@ def compute_region_stats_local(
     band_index,
 ):
     """
-    Calculate all regional statistics in Earth Engine without direct raster
-    downloads. This avoids getDownloadURL/NPY size and projection limits.
+    Compute per-day regional statistics with one client-side Earth Engine
+    request.
 
-    One reduceRegion per day produces:
-      - value_min
-      - value_max
-      - value_mean
-      - inrange_sum
-      - valid_sum
-
-    All days are returned together with one getInfo().
-
-    The period summary reproduces the previous semantics:
-    pixel-wise mean over days after threshold masking, followed by
-    min/max/mean over the selected area.
-
-    Returns:
-      (summary_min, summary_max, summary_mean,
-       period_inrange_count, period_valid_count, daily_rows)
+    Important: operate directly on the selected ImageCollection rather than
+    mapping over a list of day keys and re-filtering the collection for each
+    day. The latter can yield empty images / null reducer results in EE's
+    deferred execution graph.
     """
-    selected_days = sorted(int(d) for d in selected_days_tuple)
-    if not selected_days:
-        return None, None, None, 0, 0, []
+    selected_days = list(selected_days_tuple)
+    region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
 
-    region = ee.Geometry.Rectangle(
-        [xmin, ymin, xmax, ymax],
-        proj="EPSG:4326",
-        geodesic=False,
+    ic_sel = (
+        get_collection(kind)
+        .filter(ee.Filter.inList("day_key", selected_days))
+        .sort("day_key")
     )
 
-    # Build only the selected images and keep day_key on every image.
-    images = []
-    for day in selected_days:
-        info = DAY_KEY_TO_INFO.get(day)
-        if info is None:
-            continue
-        images.append(
-            ee.Image(info["asset_id"]).set("day_key", day)
-        )
+    stat_reducer = (
+        ee.Reducer.min()
+        .combine(ee.Reducer.max(), sharedInputs=True)
+        .combine(ee.Reducer.mean(), sharedInputs=True)
+        .combine(ee.Reducer.count(), sharedInputs=True)
+    )
 
-    if not images:
-        return None, None, None, 0, 0, []
+    def attach_stats(img):
+        img = ee.Image(img)
 
-    ic_sel = ee.ImageCollection(images)
+        # Decoded valid values (bands 4/5 have the +100 offset removed).
+        band_valid = cygnss_scaled_band(img, band_index).rename("value")
+        img_thr = cygnss_thresholded_band(
+            img, band_index, thr_min, thr_max
+        ).rename("value")
 
-    def per_day_feature(img):
-        raw = img.select(band_index)
-        valid = raw.lt(255)
-
-        value = raw.updateMask(valid)
-        if kind == "anomaly":
-            value = value.subtract(100)
-
-        inrange_bool = (
-            valid
-            .And(value.gte(thr_min))
-            .And(value.lte(thr_max))
-        )
-
-        value_thr = value.updateMask(inrange_bool).rename("value")
-
-        # 0/1 unmasked bands so SUM gives pixel counts.
-        valid_band = valid.unmask(0).toInt().rename("valid")
-        inrange_band = inrange_bool.unmask(0).toInt().rename("inrange")
-
-        stats_img = ee.Image.cat([value_thr, valid_band, inrange_band])
-
-        reducer = (
-            ee.Reducer.minMax()
-            .combine(ee.Reducer.mean(), sharedInputs=True)
-            .combine(ee.Reducer.sum(), sharedInputs=True)
-        )
-
-        stats = stats_img.reduceRegion(
-            reducer=reducer,
+        stats = img_thr.reduceRegion(
+            reducer=stat_reducer,
             geometry=region,
-            scale=STATS_SCALE_M,
-            crs="EPSG:6933",
+            scale=3000,
             maxPixels=1e13,
-            tileScale=4,
         )
 
-        day = ee.Number(img.get("day_key"))
-        return ee.Feature(
-            None,
-            {
-                "day_key": day,
-                "value_min": stats.get("value_min"),
-                "value_max": stats.get("value_max"),
-                "value_mean": stats.get("value_mean"),
-                "valid_sum": stats.get("valid_sum"),
-                "inrange_sum": stats.get("inrange_sum"),
-            },
-        )
+        total = band_valid.reduceRegion(
+            reducer=ee.Reducer.count(),
+            geometry=region,
+            scale=3000,
+            maxPixels=1e13,
+        ).get("value")
 
-    daily_fc = ee.FeatureCollection(ic_sel.map(per_day_feature))
+        return img.set({
+            "ts_min": stats.get("value_min"),
+            "ts_max": stats.get("value_max"),
+            "ts_mean": stats.get("value_mean"),
+            "ts_count_inrange": stats.get("value_count"),
+            "ts_count_total": total,
+        })
 
-    # Period summary: pixel-wise mean after threshold masking, then spatial
-    # min/max/mean over the selected rectangle.
-    def threshold_image(img):
-        raw = img.select(band_index)
-        valid = raw.lt(255)
-        value = raw.updateMask(valid)
-        if kind == "anomaly":
-            value = value.subtract(100)
-        mask = value.gte(thr_min).And(value.lte(thr_max))
-        return value.updateMask(mask).rename("value")
+    ic_stats = ic_sel.map(attach_stats)
 
-    thresholded_ic = ic_sel.map(threshold_image)
-    pixel_mean = thresholded_ic.mean()
+    # One getInfo() returns all per-day arrays together.
+    payload = ee.Dictionary({
+        "day_key": ic_stats.aggregate_array("day_key"),
+        "min": ic_stats.aggregate_array("ts_min"),
+        "max": ic_stats.aggregate_array("ts_max"),
+        "mean": ic_stats.aggregate_array("ts_mean"),
+        "count_inrange": ic_stats.aggregate_array("ts_count_inrange"),
+        "count_total": ic_stats.aggregate_array("ts_count_total"),
+    }).getInfo()
 
-    summary_stats = pixel_mean.reduceRegion(
-        reducer=(
-            ee.Reducer.minMax()
-            .combine(ee.Reducer.mean(), sharedInputs=True)
-        ),
-        geometry=region,
-        scale=STATS_SCALE_M,
-        crs="EPSG:6933",
-        maxPixels=1e13,
-        tileScale=4,
+    day_keys = payload.get("day_key", [])
+    mins = payload.get("min", [])
+    maxs = payload.get("max", [])
+    means = payload.get("mean", [])
+    counts_in = payload.get("count_inrange", [])
+    counts_total = payload.get("count_total", [])
+
+    results = []
+    for i, day_raw in enumerate(day_keys):
+        day = int(day_raw)
+
+        vmin = mins[i] if i < len(mins) else None
+        vmax = maxs[i] if i < len(maxs) else None
+        vmean = means[i] if i < len(means) else None
+        cnt_in = counts_in[i] if i < len(counts_in) else None
+        cnt_tot = counts_total[i] if i < len(counts_total) else None
+
+        results.append({
+            "date": DAY_KEY_TO_LABEL.get(day, str(day)),
+            "min": float(vmin) if vmin is not None else 0.0,
+            "max": float(vmax) if vmax is not None else 0.0,
+            "mean": float(vmean) if vmean is not None else 0.0,
+            "count_total": int(cnt_tot) if cnt_tot is not None else 0,
+            "count_inrange": int(cnt_in) if cnt_in is not None else 0,
+        })
+
+    return results
+
+
+# ---------------------------------------------
+# SUMMARY STATS FOR MEAN IMAGE OVER AREA (CACHE)
+# ---------------------------------------------
+@st.cache_data
+def compute_region_summary_for_bbox(
+    selected_days_tuple,
+    thr_min,
+    thr_max,
+    xmin,
+    ymin,
+    xmax,
+    ymax,
+    kind,
+    band_index,
+):
+    """Compute min/max/mean for the period with one reduceRegion request."""
+    selected_days = list(selected_days_tuple)
+    region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
+
+    ic = get_collection(kind)
+    ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
+    ic_proc = ic_sel.map(
+        lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max)
     )
 
-    # Period "any valid" and "any in-range" counts, matching the previous code.
-    def valid_any_img(img):
-        raw = img.select(band_index)
-        return raw.lt(255).unmask(0).toInt().rename("valid")
+    pixel_mean = ic_proc.mean().rename("value")
+    reducer = (
+        ee.Reducer.min()
+        .combine(ee.Reducer.max(), sharedInputs=True)
+        .combine(ee.Reducer.mean(), sharedInputs=True)
+    )
 
-    def inrange_any_img(img):
-        raw = img.select(band_index)
-        valid = raw.lt(255)
-        value = raw.updateMask(valid)
-        if kind == "anomaly":
-            value = value.subtract(100)
+    stats = pixel_mean.reduceRegion(
+        reducer=reducer,
+        geometry=region,
+        scale=3000,
+        maxPixels=1e13,
+        bestEffort=True,
+    ).getInfo()
+
+    rmin = stats.get("value_min")
+    rmax = stats.get("value_max")
+    rmean = stats.get("value_mean")
+
+    return (
+        float(rmin) if rmin is not None else None,
+        float(rmax) if rmax is not None else None,
+        float(rmean) if rmean is not None else None,
+    )
+
+
+# ---------------------------------------------
+# PIXEL COUNTS FOR SELECTED PERIOD (CACHE)
+# ---------------------------------------------
+@st.cache_data
+def compute_region_pixel_count(
+    selected_days_tuple,
+    thr_min,
+    thr_max,
+    xmin,
+    ymin,
+    xmax,
+    ymax,
+    kind,
+    band_index,
+):
+    """Compute both pixel counts in one Earth Engine reduceRegion call."""
+    selected_days = list(selected_days_tuple)
+    region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
+
+    ic_sel = get_collection(kind).filter(ee.Filter.inList("day_key", selected_days))
+
+    def valid_mask(img):
+        return cygnss_valid_raw_band(img, band_index).mask().unmask(0).toInt().rename("valid")
+
+    def inrange_mask(img):
+        band = cygnss_scaled_band(img, band_index)
         return (
-            valid
-            .And(value.gte(thr_min))
-            .And(value.lte(thr_max))
+            band.gte(thr_min)
+            .And(band.lte(thr_max))
             .unmask(0)
             .toInt()
             .rename("inrange")
         )
 
-    period_count_img = ee.Image.cat([
-        ic_sel.map(valid_any_img).max().rename("valid_any"),
-        ic_sel.map(inrange_any_img).max().rename("inrange_any"),
-    ])
+    valid_any = ic_sel.map(valid_mask).max().rename("valid")
+    inrange_any = ic_sel.map(inrange_mask).max().rename("inrange")
+    both = valid_any.addBands(inrange_any)
 
-    period_counts = period_count_img.reduceRegion(
+    counts = both.reduceRegion(
         reducer=ee.Reducer.sum(),
         geometry=region,
-        scale=STATS_SCALE_M,
-        crs="EPSG:6933",
+        scale=3000,
         maxPixels=1e13,
-        tileScale=4,
-    )
+        bestEffort=True,
+    ).getInfo()
 
-    # Fetch the three compact result objects. No raster downloads.
-    daily_info = daily_fc.getInfo()
-    summary_info = summary_stats.getInfo()
-    counts_info = period_counts.getInfo()
-
-    daily_rows = []
-    for feat in daily_info.get("features", []):
-        props = feat.get("properties", {})
-        day = int(props.get("day_key"))
-
-        vmin = props.get("value_min")
-        vmax = props.get("value_max")
-        vmean = props.get("value_mean")
-        cnt_total = props.get("valid_sum")
-        cnt_in = props.get("inrange_sum")
-
-        daily_rows.append(
-            {
-                "date": DAY_KEY_TO_LABEL.get(day, str(day)),
-                "min": float(vmin) if vmin is not None else 0.0,
-                "max": float(vmax) if vmax is not None else 0.0,
-                "mean": float(vmean) if vmean is not None else 0.0,
-                "count_total": int(round(cnt_total)) if cnt_total is not None else 0,
-                "count_inrange": int(round(cnt_in)) if cnt_in is not None else 0,
-            }
-        )
-
-    daily_rows.sort(key=lambda row: row["date"])
-
-    summary_min = summary_info.get("value_min")
-    summary_max = summary_info.get("value_max")
-    summary_mean = summary_info.get("value_mean")
-
-    period_valid_count = counts_info.get("valid_any")
-    period_inrange_count = counts_info.get("inrange_any")
-
-    return (
-        float(summary_min) if summary_min is not None else None,
-        float(summary_max) if summary_max is not None else None,
-        float(summary_mean) if summary_mean is not None else None,
-        int(round(period_inrange_count)) if period_inrange_count is not None else 0,
-        int(round(period_valid_count)) if period_valid_count is not None else 0,
-        daily_rows,
-    )
+    total_count = int(counts.get("valid") or 0)
+    in_range_count = int(counts.get("inrange") or 0)
+    return in_range_count, total_count
 
 
 # ---------------------------------------------
@@ -1654,25 +1641,41 @@ else:
             xmin, xmax = min(lons), max(lons)
             ymin, ymax = min(lats), max(lats)
 
-            with st.spinner("Loading selected pixels and calculating statistics..."):
-                (
-                    user_min,
-                    user_max,
-                    user_mean,
-                    pixel_count_inrange,
-                    pixel_count_total,
-                    region_ts,
-                ) = compute_region_stats_local(
-                    left_sel_days_tuple,
-                    left_thr_min,
-                    left_thr_max,
-                    xmin,
-                    ymin,
-                    xmax,
-                    ymax,
-                    stats_kind,
-                    stats_band_index,
-                )
+            user_min, user_max, user_mean = compute_region_summary_for_bbox(
+                left_sel_days_tuple,
+                left_thr_min,
+                left_thr_max,
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                stats_kind,
+                stats_band_index,
+            )
+
+            pixel_count_inrange, pixel_count_total = compute_region_pixel_count(
+                left_sel_days_tuple,
+                left_thr_min,
+                left_thr_max,
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                stats_kind,
+                stats_band_index,
+            )
+
+            region_ts = compute_region_ts_for_bbox(
+                left_sel_days_tuple,
+                left_thr_min,
+                left_thr_max,
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                stats_kind,
+                stats_band_index,
+            )
 
             if any(v is None for v in (user_min, user_max, user_mean)) or pixel_count_total == 0:
                 st.info(
