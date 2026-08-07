@@ -614,40 +614,44 @@ def compute_region_ts_for_bbox(
     band_index,
 ):
     """
-    Compute per-day regional statistics with a SINGLE Earth Engine request.
+    Compute per-day regional statistics with one client-side Earth Engine
+    request.
 
-    The previous implementation called reduceRegion(...).getInfo() several
-    times for every day. Here all statistics are calculated server-side and
-    returned as one FeatureCollection.
+    Important: operate directly on the selected ImageCollection rather than
+    mapping over a list of day keys and re-filtering the collection for each
+    day. The latter can yield empty images / null reducer results in EE's
+    deferred execution graph.
     """
     selected_days = list(selected_days_tuple)
     region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
 
-    ic = get_collection(kind)
+    ic_sel = (
+        get_collection(kind)
+        .filter(ee.Filter.inList("day_key", selected_days))
+        .sort("day_key")
+    )
 
-    def stats_for_day(day):
-        day = ee.Number(day).toInt()
-        img = ee.Image(ic.filter(ee.Filter.eq("day_key", day)).first())
+    stat_reducer = (
+        ee.Reducer.min()
+        .combine(ee.Reducer.max(), sharedInputs=True)
+        .combine(ee.Reducer.mean(), sharedInputs=True)
+        .combine(ee.Reducer.count(), sharedInputs=True)
+    )
 
-        # Real/decoded values used for all statistics.
-        band_valid = cygnss_scaled_band(img, band_index)
-        img_thr = cygnss_thresholded_band(img, band_index, thr_min, thr_max)
+    def attach_stats(img):
+        img = ee.Image(img)
 
-        # Min/max/mean/count are computed together instead of four separate
-        # reduceRegion calls.
-        stat_reducer = (
-            ee.Reducer.min()
-            .combine(ee.Reducer.max(), sharedInputs=True)
-            .combine(ee.Reducer.mean(), sharedInputs=True)
-            .combine(ee.Reducer.count(), sharedInputs=True)
-        )
+        # Decoded valid values (bands 4/5 have the +100 offset removed).
+        band_valid = cygnss_scaled_band(img, band_index).rename("value")
+        img_thr = cygnss_thresholded_band(
+            img, band_index, thr_min, thr_max
+        ).rename("value")
 
         stats = img_thr.reduceRegion(
             reducer=stat_reducer,
             geometry=region,
             scale=3000,
             maxPixels=1e13,
-            bestEffort=True,
         )
 
         total = band_valid.reduceRegion(
@@ -655,40 +659,53 @@ def compute_region_ts_for_bbox(
             geometry=region,
             scale=3000,
             maxPixels=1e13,
-            bestEffort=True,
         ).get("value")
 
-        return ee.Feature(
-            None,
-            {
-                "day_key": day,
-                "min": stats.get("value_min"),
-                "max": stats.get("value_max"),
-                "mean": stats.get("value_mean"),
-                "count_inrange": stats.get("value_count"),
-                "count_total": total,
-            },
-        )
+        return img.set({
+            "ts_min": stats.get("value_min"),
+            "ts_max": stats.get("value_max"),
+            "ts_mean": stats.get("value_mean"),
+            "ts_count_inrange": stats.get("value_count"),
+            "ts_count_total": total,
+        })
 
-    features = ee.List(selected_days).map(stats_for_day)
-    fc = ee.FeatureCollection(features).sort("day_key")
-    info = fc.getInfo()
+    ic_stats = ic_sel.map(attach_stats)
+
+    # One getInfo() returns all per-day arrays together.
+    payload = ee.Dictionary({
+        "day_key": ic_stats.aggregate_array("day_key"),
+        "min": ic_stats.aggregate_array("ts_min"),
+        "max": ic_stats.aggregate_array("ts_max"),
+        "mean": ic_stats.aggregate_array("ts_mean"),
+        "count_inrange": ic_stats.aggregate_array("ts_count_inrange"),
+        "count_total": ic_stats.aggregate_array("ts_count_total"),
+    }).getInfo()
+
+    day_keys = payload.get("day_key", [])
+    mins = payload.get("min", [])
+    maxs = payload.get("max", [])
+    means = payload.get("mean", [])
+    counts_in = payload.get("count_inrange", [])
+    counts_total = payload.get("count_total", [])
 
     results = []
-    for feature in info.get("features", []):
-        props = feature.get("properties", {})
-        day = int(props.get("day_key"))
+    for i, day_raw in enumerate(day_keys):
+        day = int(day_raw)
 
-        results.append(
-            {
-                "date": DAY_KEY_TO_LABEL.get(day, str(day)),
-                "min": float(props["min"]) if props.get("min") is not None else 0.0,
-                "max": float(props["max"]) if props.get("max") is not None else 0.0,
-                "mean": float(props["mean"]) if props.get("mean") is not None else 0.0,
-                "count_total": int(props.get("count_total") or 0),
-                "count_inrange": int(props.get("count_inrange") or 0),
-            }
-        )
+        vmin = mins[i] if i < len(mins) else None
+        vmax = maxs[i] if i < len(maxs) else None
+        vmean = means[i] if i < len(means) else None
+        cnt_in = counts_in[i] if i < len(counts_in) else None
+        cnt_tot = counts_total[i] if i < len(counts_total) else None
+
+        results.append({
+            "date": DAY_KEY_TO_LABEL.get(day, str(day)),
+            "min": float(vmin) if vmin is not None else 0.0,
+            "max": float(vmax) if vmax is not None else 0.0,
+            "mean": float(vmean) if vmean is not None else 0.0,
+            "count_total": int(cnt_tot) if cnt_tot is not None else 0,
+            "count_inrange": int(cnt_in) if cnt_in is not None else 0,
+        })
 
     return results
 
