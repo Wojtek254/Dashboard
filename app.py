@@ -1,9 +1,12 @@
 # app.py
-# pip install streamlit folium earthengine-api streamlit-folium pandas altair google-auth
+# pip install streamlit folium earthengine-api streamlit-folium pandas altair google-auth numpy
 
 import datetime as dt
 import io
 import re
+import urllib.request
+
+import numpy as np
 
 import altair as alt
 import ee
@@ -36,7 +39,7 @@ ASSET_FOLDER = f"projects/{PROJECT_ID}/assets"
 ASSET_NAME_RE = re.compile(r"^inundation_5bands_(\d{4})_(\d{1,3})$")
 
 CENTER = [0.5, 108.0]
-ZOOM = 4
+ZOOM = 6
 
 # Color palette for inundation
 PALETTE_INUND = [
@@ -599,122 +602,93 @@ def selected_cygnss_layer(shading_layer, contour_layer):
     if is_cygnss_layer(contour_layer):
         return contour_layer
     return None
-# TIME SERIES FOR AREA (CACHE)
+# LOCAL BBOX STATISTICS (CACHE)
 # ---------------------------------------------
-@st.cache_data
-def compute_region_ts_for_bbox(
-    selected_days_tuple,
-    thr_min,
-    thr_max,
-    xmin,
-    ymin,
-    xmax,
-    ymax,
-    kind,
-    band_index,
-):
-    """
-    Compute per-day regional statistics with one client-side Earth Engine
-    request.
+# Statistics are intentionally calculated locally. Earth Engine is used only
+# to crop/download the selected CYGNSS band for the user's rectangle. This
+# avoids running reduceRegion repeatedly for every day.
+STATS_SCALE_M = 3000
+DOWNLOAD_DAYS_PER_CHUNK = 20
 
-    Important: operate directly on the selected ImageCollection rather than
-    mapping over a list of day keys and re-filtering the collection for each
-    day. The latter can yield empty images / null reducer results in EE's
-    deferred execution graph.
-    """
-    selected_days = list(selected_days_tuple)
-    region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
 
-    ic_sel = (
-        get_collection(kind)
-        .filter(ee.Filter.inList("day_key", selected_days))
-        .sort("day_key")
+def _download_ee_npy(image, region):
+    """Download a small EE image as a NumPy array."""
+    url = image.getDownloadURL(
+        {
+            "region": region,
+            "scale": STATS_SCALE_M,
+            "crs": "EPSG:6933",
+            "format": "NPY",
+        }
     )
+    with urllib.request.urlopen(url, timeout=180) as response:
+        payload = response.read()
+    return np.load(io.BytesIO(payload), allow_pickle=False)
 
-    stat_reducer = (
-        ee.Reducer.min()
-        .combine(ee.Reducer.max(), sharedInputs=True)
-        .combine(ee.Reducer.mean(), sharedInputs=True)
-        .combine(ee.Reducer.count(), sharedInputs=True)
-    )
 
-    def attach_stats(img):
-        img = ee.Image(img)
+def _download_day_arrays_adaptive(day_image_pairs, region):
+    """Download a stack, recursively splitting it when EE rejects the request.
 
-        # Decoded valid values (bands 4/5 have the +100 offset removed).
-        band_valid = cygnss_scaled_band(img, band_index).rename("value")
-        img_thr = cygnss_thresholded_band(
-            img, band_index, thr_min, thr_max
-        ).rename("value")
+    getDownloadURL is intended for small image chunks and has strict request
+    limits. A bbox that is fine for a few dates can be too large when many
+    dates are concatenated into bands. Instead of relying on one fixed chunk
+    size, try the whole chunk first and bisect it on an Earth Engine download
+    error. This keeps small regions fast while making larger regions robust.
 
-        stats = img_thr.reduceRegion(
-            reducer=stat_reducer,
-            geometry=region,
-            scale=3000,
-            maxPixels=1e13,
+    Returns an ordered list of (day_key, 2-D ndarray) pairs.
+    """
+    if not day_image_pairs:
+        return []
+
+    days = [day for day, _ in day_image_pairs]
+    images = [img for _, img in day_image_pairs]
+
+    try:
+        stack_img = ee.Image.cat(images).clip(region)
+        npy = _download_ee_npy(stack_img, region)
+        arrays = _npy_to_band_arrays(npy, len(images))
+        return list(zip(days, arrays))
+    except ee.EEException as exc:
+        if len(day_image_pairs) == 1:
+            raise RuntimeError(
+                "Earth Engine could not download even a single-day crop for the "
+                "selected rectangle. Try drawing a smaller rectangle. "
+                f"EE error: {exc}"
+            ) from exc
+
+        mid = len(day_image_pairs) // 2
+        left = _download_day_arrays_adaptive(day_image_pairs[:mid], region)
+        right = _download_day_arrays_adaptive(day_image_pairs[mid:], region)
+        return left + right
+
+
+def _npy_to_band_arrays(arr, expected_count):
+    """Normalize EE's NPY response into an ordered list of 2-D arrays."""
+    if arr.dtype.names:
+        arrays = [np.asarray(arr[name]) for name in arr.dtype.names]
+    elif arr.ndim == 2:
+        arrays = [arr]
+    elif arr.ndim == 3:
+        # Earth Engine normally returns structured NPY for multiband images,
+        # but support both common plain-array layouts as a safeguard.
+        if arr.shape[-1] == expected_count:
+            arrays = [arr[..., i] for i in range(expected_count)]
+        elif arr.shape[0] == expected_count:
+            arrays = [arr[i, ...] for i in range(expected_count)]
+        else:
+            raise ValueError(f"Unexpected NPY shape from Earth Engine: {arr.shape}")
+    else:
+        raise ValueError(f"Unexpected NPY response from Earth Engine: shape={arr.shape}")
+
+    if len(arrays) != expected_count:
+        raise ValueError(
+            f"Earth Engine returned {len(arrays)} band(s), expected {expected_count}."
         )
-
-        total = band_valid.reduceRegion(
-            reducer=ee.Reducer.count(),
-            geometry=region,
-            scale=3000,
-            maxPixels=1e13,
-        ).get("value")
-
-        return img.set({
-            "ts_min": stats.get("value_min"),
-            "ts_max": stats.get("value_max"),
-            "ts_mean": stats.get("value_mean"),
-            "ts_count_inrange": stats.get("value_count"),
-            "ts_count_total": total,
-        })
-
-    ic_stats = ic_sel.map(attach_stats)
-
-    # One getInfo() returns all per-day arrays together.
-    payload = ee.Dictionary({
-        "day_key": ic_stats.aggregate_array("day_key"),
-        "min": ic_stats.aggregate_array("ts_min"),
-        "max": ic_stats.aggregate_array("ts_max"),
-        "mean": ic_stats.aggregate_array("ts_mean"),
-        "count_inrange": ic_stats.aggregate_array("ts_count_inrange"),
-        "count_total": ic_stats.aggregate_array("ts_count_total"),
-    }).getInfo()
-
-    day_keys = payload.get("day_key", [])
-    mins = payload.get("min", [])
-    maxs = payload.get("max", [])
-    means = payload.get("mean", [])
-    counts_in = payload.get("count_inrange", [])
-    counts_total = payload.get("count_total", [])
-
-    results = []
-    for i, day_raw in enumerate(day_keys):
-        day = int(day_raw)
-
-        vmin = mins[i] if i < len(mins) else None
-        vmax = maxs[i] if i < len(maxs) else None
-        vmean = means[i] if i < len(means) else None
-        cnt_in = counts_in[i] if i < len(counts_in) else None
-        cnt_tot = counts_total[i] if i < len(counts_total) else None
-
-        results.append({
-            "date": DAY_KEY_TO_LABEL.get(day, str(day)),
-            "min": float(vmin) if vmin is not None else 0.0,
-            "max": float(vmax) if vmax is not None else 0.0,
-            "mean": float(vmean) if vmean is not None else 0.0,
-            "count_total": int(cnt_tot) if cnt_tot is not None else 0,
-            "count_inrange": int(cnt_in) if cnt_in is not None else 0,
-        })
-
-    return results
+    return arrays
 
 
-# ---------------------------------------------
-# SUMMARY STATS FOR MEAN IMAGE OVER AREA (CACHE)
-# ---------------------------------------------
-@st.cache_data
-def compute_region_summary_for_bbox(
+@st.cache_data(show_spinner=False)
+def compute_region_stats_local(
     selected_days_tuple,
     thr_min,
     thr_max,
@@ -725,91 +699,129 @@ def compute_region_summary_for_bbox(
     kind,
     band_index,
 ):
-    """Compute min/max/mean for the period with one reduceRegion request."""
-    selected_days = list(selected_days_tuple)
-    region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
+    """
+    Download only the selected bbox and compute every regional statistic in
+    NumPy. Earth Engine does no per-day reduceRegion work here.
 
-    ic = get_collection(kind)
-    ic_sel = ic.filter(ee.Filter.inList("day_key", selected_days))
-    ic_proc = ic_sel.map(
-        lambda img: cygnss_thresholded_band(img, band_index, thr_min, thr_max)
-    )
+    Returns:
+      (summary_min, summary_max, summary_mean,
+       period_inrange_count, period_valid_count, daily_rows)
+    """
+    selected_days = sorted(int(d) for d in selected_days_tuple)
+    region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax], proj="EPSG:4326", geodesic=False)
 
-    pixel_mean = ic_proc.mean().rename("value")
-    reducer = (
-        ee.Reducer.min()
-        .combine(ee.Reducer.max(), sharedInputs=True)
-        .combine(ee.Reducer.mean(), sharedInputs=True)
-    )
+    # Running per-pixel accumulators reproduce EE ImageCollection.mean() after
+    # threshold masking, without keeping the full time x y cube in memory.
+    pixel_sum = None
+    pixel_n = None
+    valid_any = None
+    inrange_any = None
+    daily_rows = []
 
-    stats = pixel_mean.reduceRegion(
-        reducer=reducer,
-        geometry=region,
-        scale=3000,
-        maxPixels=1e13,
-        bestEffort=True,
-    ).getInfo()
+    for chunk_start in range(0, len(selected_days), DOWNLOAD_DAYS_PER_CHUNK):
+        chunk_days = selected_days[chunk_start:chunk_start + DOWNLOAD_DAYS_PER_CHUNK]
 
-    rmin = stats.get("value_min")
-    rmax = stats.get("value_max")
-    rmean = stats.get("value_mean")
+        day_image_pairs = []
+        for day in chunk_days:
+            info = DAY_KEY_TO_INFO.get(day)
+            if info is None:
+                continue
+            day_image_pairs.append(
+                (
+                    day,
+                    ee.Image(info["asset_id"])
+                    .select(band_index)
+                    .rename(f"d_{day}"),
+                )
+            )
 
+        if not day_image_pairs:
+            continue
+
+        # Try a reasonably large batch first. If getDownloadURL rejects it
+        # because the crop is too large, recursively split the batch until it
+        # fits. This avoids a fragile fixed number of days per request.
+        downloaded = _download_day_arrays_adaptive(day_image_pairs, region)
+
+        for day, raw in downloaded:
+            raw = np.asarray(raw)
+            valid = raw < 255
+
+            values = raw.astype(np.float32, copy=False)
+            if kind == "anomaly":
+                values = values - 100.0
+
+            inrange = valid & (values >= thr_min) & (values <= thr_max)
+
+            if pixel_sum is None:
+                shape = raw.shape
+                pixel_sum = np.zeros(shape, dtype=np.float64)
+                pixel_n = np.zeros(shape, dtype=np.uint16)
+                valid_any = np.zeros(shape, dtype=bool)
+                inrange_any = np.zeros(shape, dtype=bool)
+
+            # All chunks use the same region/projection/scale. Guard against an
+            # unexpected service-side grid change rather than silently misaligning.
+            if raw.shape != pixel_sum.shape:
+                raise ValueError(
+                    "Earth Engine returned different raster dimensions between chunks "
+                    f"({raw.shape} vs {pixel_sum.shape})."
+                )
+
+            valid_any |= valid
+            inrange_any |= inrange
+
+            cnt_total = int(np.count_nonzero(valid))
+            cnt_in = int(np.count_nonzero(inrange))
+
+            if cnt_in:
+                vals = values[inrange]
+                vmin = float(np.min(vals))
+                vmax = float(np.max(vals))
+                vmean = float(np.mean(vals))
+                pixel_sum[inrange] += values[inrange]
+                pixel_n[inrange] += 1
+            else:
+                vmin = vmax = vmean = 0.0
+
+            daily_rows.append(
+                {
+                    "date": DAY_KEY_TO_LABEL.get(day, str(day)),
+                    "min": vmin,
+                    "max": vmax,
+                    "mean": vmean,
+                    "count_total": cnt_total,
+                    "count_inrange": cnt_in,
+                }
+            )
+
+    if pixel_sum is None:
+        return None, None, None, 0, 0, []
+
+    has_mean = pixel_n > 0
+    if np.any(has_mean):
+        pixel_mean = np.empty(pixel_sum.shape, dtype=np.float64)
+        pixel_mean.fill(np.nan)
+        pixel_mean[has_mean] = pixel_sum[has_mean] / pixel_n[has_mean]
+        vals = pixel_mean[has_mean]
+        summary_min = float(np.min(vals))
+        summary_max = float(np.max(vals))
+        summary_mean = float(np.mean(vals))
+    else:
+        summary_min = summary_max = summary_mean = None
+
+    period_valid_count = int(np.count_nonzero(valid_any))
+    period_inrange_count = int(np.count_nonzero(inrange_any))
+
+    daily_rows.sort(key=lambda row: row["date"])
     return (
-        float(rmin) if rmin is not None else None,
-        float(rmax) if rmax is not None else None,
-        float(rmean) if rmean is not None else None,
+        summary_min,
+        summary_max,
+        summary_mean,
+        period_inrange_count,
+        period_valid_count,
+        daily_rows,
     )
-
-
-# ---------------------------------------------
-# PIXEL COUNTS FOR SELECTED PERIOD (CACHE)
-# ---------------------------------------------
-@st.cache_data
-def compute_region_pixel_count(
-    selected_days_tuple,
-    thr_min,
-    thr_max,
-    xmin,
-    ymin,
-    xmax,
-    ymax,
-    kind,
-    band_index,
-):
-    """Compute both pixel counts in one Earth Engine reduceRegion call."""
-    selected_days = list(selected_days_tuple)
-    region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
-
-    ic_sel = get_collection(kind).filter(ee.Filter.inList("day_key", selected_days))
-
-    def valid_mask(img):
-        return cygnss_valid_raw_band(img, band_index).mask().unmask(0).toInt().rename("valid")
-
-    def inrange_mask(img):
-        band = cygnss_scaled_band(img, band_index)
-        return (
-            band.gte(thr_min)
-            .And(band.lte(thr_max))
-            .unmask(0)
-            .toInt()
-            .rename("inrange")
-        )
-
-    valid_any = ic_sel.map(valid_mask).max().rename("valid")
-    inrange_any = ic_sel.map(inrange_mask).max().rename("inrange")
-    both = valid_any.addBands(inrange_any)
-
-    counts = both.reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=region,
-        scale=3000,
-        maxPixels=1e13,
-        bestEffort=True,
-    ).getInfo()
-
-    total_count = int(counts.get("valid") or 0)
-    in_range_count = int(counts.get("inrange") or 0)
-    return in_range_count, total_count
 
 
 # ---------------------------------------------
@@ -888,17 +900,40 @@ def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, position, bot
     )
 
 
+WORLD_PREVIEW_BOUNDS = [[-85.0, -180.0], [85.0, 180.0]]
+WORLD_PREVIEW_REGION = ee.Geometry.Rectangle([-180.0, -85.0, 180.0, 85.0], geodesic=False)
+WORLD_PREVIEW_DIMENSIONS = "8192x4096"
+
+
 def ee_tile_url(visual_image):
-    """Resolve an Earth Engine visualization to a tile URL once."""
+    """Resolve an Earth Engine visualization to a high-resolution tile URL."""
     map_id = visual_image.getMapId({})
     return map_id["tile_fetcher"].url_format
 
 
-def build_map_from_tiles(
+def ee_global_preview_url(visual_image):
+    """Return one cached-friendly global PNG for fast map display.
+
+    The preview covers the whole usable Web-Mercator world. It is only a
+    display product; statistics still use the original Earth Engine assets.
+    """
+    return visual_image.getThumbURL(
+        {
+            "region": WORLD_PREVIEW_REGION,
+            "dimensions": WORLD_PREVIEW_DIMENSIONS,
+            "format": "png",
+            "crs": "EPSG:4326",
+        }
+    )
+
+
+def build_map_from_previews(
+    left_preview_url,
     left_tile_url,
     left_label,
     map_center=None,
     map_zoom=None,
+    right_preview_url=None,
     right_tile_url=None,
     right_label=None,
     left_shading_layer="none",
@@ -910,11 +945,11 @@ def build_map_from_tiles(
     right_thr_min=None,
     right_thr_max=None,
 ):
-    """Build a fresh Folium object from already-resolved tile URLs.
+    """Build the map from one global preview image per side.
 
-    A fresh Folium object is intentional. st_folium mutates Folium objects while
-    generating its Leaflet script, so reusing the same folium.Map from
-    session_state can change the component hash and remount the map.
+    This keeps the complete world available while avoiding dozens of Earth
+    Engine tile requests for the normal display. The original EE tile layer is
+    also present (hidden by default) as an optional full-resolution overlay.
     """
     try:
         if map_center is None:
@@ -924,28 +959,56 @@ def build_map_from_tiles(
 
         m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
 
-        left_layer = folium.TileLayer(
-            tiles=left_tile_url,
-            attr="Google Earth Engine",
-            name=left_label,
+        left_layer = folium.raster_layers.ImageOverlay(
+            image=left_preview_url,
+            bounds=WORLD_PREVIEW_BOUNDS,
+            opacity=1.0,
+            name=f"{left_label} | fast global preview",
             overlay=True,
             control=True,
+            cross_origin=True,
+            zindex=2,
         )
         left_layer.add_to(m)
 
-        if right_tile_url is not None:
+        # Optional native-resolution EE tiles. Hidden initially so the browser
+        # does not request them until the user explicitly enables the layer.
+        if left_tile_url:
+            folium.TileLayer(
+                tiles=left_tile_url,
+                attr="Google Earth Engine",
+                name=f"{left_label} | high-resolution EE tiles",
+                overlay=True,
+                control=True,
+                show=False,
+            ).add_to(m)
+
+        if right_preview_url is not None:
             if right_label is None:
                 right_label = "SECONDARY layer"
 
-            right_layer = folium.TileLayer(
-                tiles=right_tile_url,
-                attr="Google Earth Engine",
-                name=right_label,
+            right_layer = folium.raster_layers.ImageOverlay(
+                image=right_preview_url,
+                bounds=WORLD_PREVIEW_BOUNDS,
+                opacity=1.0,
+                name=f"{right_label} | fast global preview",
                 overlay=True,
                 control=True,
+                cross_origin=True,
+                zindex=2,
             )
             right_layer.add_to(m)
             SideBySideLayers(left_layer, right_layer).add_to(m)
+
+            if right_tile_url:
+                folium.TileLayer(
+                    tiles=right_tile_url,
+                    attr="Google Earth Engine",
+                    name=f"{right_label} | high-resolution EE tiles",
+                    overlay=True,
+                    control=True,
+                    show=False,
+                ).add_to(m)
 
         Draw(
             export=False,
@@ -975,7 +1038,7 @@ def build_map_from_tiles(
             position="left", bottom="260px", role="contour"
         )
 
-        if right_tile_url is not None:
+        if right_preview_url is not None:
             add_layer_colorbar(
                 m, "SECONDARY", right_shading_layer, right_thr_min, right_thr_max,
                 position="right", bottom="40px", role="shading"
@@ -1308,9 +1371,15 @@ if "map_center" not in st.session_state:
 if "map_zoom" not in st.session_state:
     st.session_state.map_zoom = ZOOM
 
-# Cache only Earth Engine tile URLs, never the Folium map itself.
+# Cache only display URLs, never the Folium map itself. The global preview URL
+# is the normal display layer; native EE tiles remain available as an optional
+# high-resolution overlay.
 if "map_tile_signature" not in st.session_state:
     st.session_state.map_tile_signature = None
+if "left_preview_url" not in st.session_state:
+    st.session_state.left_preview_url = None
+if "right_preview_url" not in st.session_state:
+    st.session_state.right_preview_url = None
 if "left_tile_url" not in st.session_state:
     st.session_state.left_tile_url = None
 if "right_tile_url" not in st.session_state:
@@ -1514,9 +1583,9 @@ if split_view and right_start_date is not None:
 # ---------------------------------------------
 # BUILD / DISPLAY MAP
 # ---------------------------------------------
-# Resolve Earth Engine tile URLs only when map-defining controls change.
-# Drawing a rectangle does NOT change this signature, so no new EE map request
-# is made on the drawing-triggered rerun.
+# Resolve one global preview URL (plus optional native EE tiles) only when
+# map-defining controls change. Drawing a rectangle does NOT change this
+# signature, so the display image is reused on the drawing-triggered rerun.
 map_signature = (
     bool(split_view),
     left_shading_layer,
@@ -1532,7 +1601,7 @@ map_signature = (
 )
 
 if (
-    st.session_state.left_tile_url is None
+    st.session_state.left_preview_url is None
     or st.session_state.map_tile_signature != map_signature
 ):
     try:
@@ -1545,11 +1614,15 @@ if (
             shading_layer=left_shading_layer,
             contour_layer=left_contour_layer,
         )
+        # One global PNG is the normal display layer. The native tile URL is
+        # resolved at the same time but stays hidden until explicitly enabled.
+        st.session_state.left_preview_url = ee_global_preview_url(left_visual_image)
         st.session_state.left_tile_url = ee_tile_url(left_visual_image)
     except Exception as e:
         st.error(f"Failed to build MAIN image: {e}")
         st.stop()
 
+    st.session_state.right_preview_url = None
     st.session_state.right_tile_url = None
     if split_view and right_sel_days is not None:
         try:
@@ -1562,6 +1635,7 @@ if (
                 shading_layer=right_shading_layer,
                 contour_layer=right_contour_layer,
             )
+            st.session_state.right_preview_url = ee_global_preview_url(right_visual_image)
             st.session_state.right_tile_url = ee_tile_url(right_visual_image)
         except Exception as e:
             st.error(f"Failed to build SECONDARY image: {e}")
@@ -1569,14 +1643,15 @@ if (
 
     st.session_state.map_tile_signature = map_signature
 
-# Build a fresh Folium wrapper from stable tile URLs. Because its generated
-# base script is unchanged on a drawing-only rerun, st_folium keeps the same
-# frontend Leaflet map instead of remounting it.
-m = build_map_from_tiles(
+# Build a fresh Folium wrapper from stable preview URLs. The preview covers the
+# whole world; CENTER/ZOOM only determine the initial viewport (Sumatra).
+m = build_map_from_previews(
+    left_preview_url=st.session_state.left_preview_url,
     left_tile_url=st.session_state.left_tile_url,
     left_label=left_label,
     map_center=st.session_state.map_center,
     map_zoom=st.session_state.map_zoom,
+    right_preview_url=st.session_state.right_preview_url if split_view else None,
     right_tile_url=st.session_state.right_tile_url if split_view else None,
     right_label=right_label,
     left_shading_layer=left_shading_layer,
@@ -1641,41 +1716,25 @@ else:
             xmin, xmax = min(lons), max(lons)
             ymin, ymax = min(lats), max(lats)
 
-            user_min, user_max, user_mean = compute_region_summary_for_bbox(
-                left_sel_days_tuple,
-                left_thr_min,
-                left_thr_max,
-                xmin,
-                ymin,
-                xmax,
-                ymax,
-                stats_kind,
-                stats_band_index,
-            )
-
-            pixel_count_inrange, pixel_count_total = compute_region_pixel_count(
-                left_sel_days_tuple,
-                left_thr_min,
-                left_thr_max,
-                xmin,
-                ymin,
-                xmax,
-                ymax,
-                stats_kind,
-                stats_band_index,
-            )
-
-            region_ts = compute_region_ts_for_bbox(
-                left_sel_days_tuple,
-                left_thr_min,
-                left_thr_max,
-                xmin,
-                ymin,
-                xmax,
-                ymax,
-                stats_kind,
-                stats_band_index,
-            )
+            with st.spinner("Loading selected pixels and calculating statistics..."):
+                (
+                    user_min,
+                    user_max,
+                    user_mean,
+                    pixel_count_inrange,
+                    pixel_count_total,
+                    region_ts,
+                ) = compute_region_stats_local(
+                    left_sel_days_tuple,
+                    left_thr_min,
+                    left_thr_max,
+                    xmin,
+                    ymin,
+                    xmax,
+                    ymax,
+                    stats_kind,
+                    stats_band_index,
+                )
 
             if any(v is None for v in (user_min, user_max, user_mean)) or pixel_count_total == 0:
                 st.info(
