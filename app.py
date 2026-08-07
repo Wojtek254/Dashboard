@@ -1275,8 +1275,23 @@ if "map_center" not in st.session_state:
 if "map_zoom" not in st.session_state:
     st.session_state.map_zoom = ZOOM
 
+# Keep the Folium object stable across reruns caused only by drawing.
+# This prevents st_folium from receiving a freshly rebuilt map every time
+# a rectangle is created/edited.
+if "folium_map" not in st.session_state:
+    st.session_state.folium_map = None
+
+if "folium_map_signature" not in st.session_state:
+    st.session_state.folium_map_signature = None
+
+if "map_revision" not in st.session_state:
+    st.session_state.map_revision = 0
+
 if st.button("Clear selected region"):
     st.session_state.saved_feature = None
+    st.session_state.folium_map = None
+    st.session_state.folium_map_signature = None
+    st.session_state.map_revision += 1
 
 split_view = st.checkbox(
     "Enable split-view map comparison (MAIN vs SECONDARY)",
@@ -1455,80 +1470,102 @@ st.write("MAIN dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in left_sele
 if split_view and right_start_date is not None:
     st.write("SECONDARY dates used:", ", ".join(d.strftime("%Y-%m-%d") for d in right_selected_dates))
 # ---------------------------------------------
-# BUILD IMAGES FOR MAP
-# ---------------------------------------------
-try:
-    left_visual_image = build_side_visual_image(
-        selected_days=left_sel_days,
-        thr_min=left_thr_min,
-        thr_max=left_thr_max,
-        start_date=left_start_date,
-        end_date=left_end_date,
-        shading_layer=left_shading_layer,
-        contour_layer=left_contour_layer,
-    )
-except Exception as e:
-    st.error(f"Failed to build MAIN image: {e}")
-    st.stop()
-
-right_visual_image = None
-if split_view and right_sel_days is not None:
-    try:
-        right_visual_image = build_side_visual_image(
-            selected_days=right_sel_days,
-            thr_min=right_thr_min,
-            thr_max=right_thr_max,
-            start_date=right_start_date,
-            end_date=right_end_date,
-            shading_layer=right_shading_layer,
-            contour_layer=right_contour_layer,
-        )
-    except Exception as e:
-        st.error(f"Failed to build SECONDARY image: {e}")
-        st.stop()
-
-# ---------------------------------------------
 # BUILD / DISPLAY MAP
 # ---------------------------------------------
-m = build_map(
-    left_visual_image=left_visual_image,
-    left_label=left_label,
-    saved_feature=st.session_state.saved_feature,
-    map_center=st.session_state.map_center,
-    map_zoom=st.session_state.map_zoom,
-    right_visual_image=right_visual_image,
-    right_label=right_label,
-    left_shading_layer=left_shading_layer,
-    left_contour_layer=left_contour_layer,
-    right_shading_layer=right_shading_layer if split_view else "none",
-    right_contour_layer=right_contour_layer if split_view else "none",
-    left_thr_min=left_thr_min,
-    left_thr_max=left_thr_max,
-    right_thr_min=right_thr_min,
-    right_thr_max=right_thr_max,
+# A map interaction (especially drawing a rectangle) causes Streamlit to rerun
+# the script. Rebuilding the Folium object on that rerun makes Leaflet reload,
+# which removes the just-drawn rectangle from the browser.
+#
+# Therefore the map is rebuilt ONLY when map-defining controls change. On a
+# drawing-only rerun we reuse the exact same Folium object from session_state.
+map_signature = (
+    bool(split_view),
+    left_shading_layer,
+    left_contour_layer,
+    tuple(left_sel_days),
+    float(left_thr_min),
+    float(left_thr_max),
+    right_shading_layer if split_view else "none",
+    right_contour_layer if split_view else "none",
+    tuple(right_sel_days) if split_view and right_sel_days is not None else (),
+    float(right_thr_min) if right_thr_min is not None else None,
+    float(right_thr_max) if right_thr_max is not None else None,
+    st.session_state.map_revision,
 )
 
+if (
+    st.session_state.folium_map is None
+    or st.session_state.folium_map_signature != map_signature
+):
+    # Build Earth Engine visualizations only when the actual map settings changed.
+    try:
+        left_visual_image = build_side_visual_image(
+            selected_days=left_sel_days,
+            thr_min=left_thr_min,
+            thr_max=left_thr_max,
+            start_date=left_start_date,
+            end_date=left_end_date,
+            shading_layer=left_shading_layer,
+            contour_layer=left_contour_layer,
+        )
+    except Exception as e:
+        st.error(f"Failed to build MAIN image: {e}")
+        st.stop()
+
+    right_visual_image = None
+    if split_view and right_sel_days is not None:
+        try:
+            right_visual_image = build_side_visual_image(
+                selected_days=right_sel_days,
+                thr_min=right_thr_min,
+                thr_max=right_thr_max,
+                start_date=right_start_date,
+                end_date=right_end_date,
+                shading_layer=right_shading_layer,
+                contour_layer=right_contour_layer,
+            )
+        except Exception as e:
+            st.error(f"Failed to build SECONDARY image: {e}")
+            st.stop()
+
+    st.session_state.folium_map = build_map(
+        left_visual_image=left_visual_image,
+        left_label=left_label,
+        saved_feature=st.session_state.saved_feature,
+        map_center=st.session_state.map_center,
+        map_zoom=st.session_state.map_zoom,
+        right_visual_image=right_visual_image,
+        right_label=right_label,
+        left_shading_layer=left_shading_layer,
+        left_contour_layer=left_contour_layer,
+        right_shading_layer=right_shading_layer if split_view else "none",
+        right_contour_layer=right_contour_layer if split_view else "none",
+        left_thr_min=left_thr_min,
+        left_thr_max=left_thr_max,
+        right_thr_min=right_thr_min,
+        right_thr_max=right_thr_max,
+    )
+    st.session_state.folium_map_signature = map_signature
+
+m = st.session_state.folium_map
+
+# Only drawing changes are returned to Streamlit. Panning/zooming therefore do
+# not cause unnecessary Python reruns and do not rebuild the Earth Engine map.
 map_state = st_folium(
     m,
     height=650,
     width=None,
     key="cygnss_map",
+    returned_objects=["last_active_drawing", "all_drawings"],
 )
-
-if map_state is not None:
-    if map_state.get("center") is not None:
-        center_dict = map_state["center"]
-        st.session_state.map_center = [center_dict["lat"], center_dict["lng"]]
-
-    if map_state.get("zoom") is not None:
-        st.session_state.map_zoom = map_state["zoom"]
 
 current_feature = extract_feature_from_map_state(map_state)
 
 if current_feature and "geometry" in current_feature:
     st.session_state.saved_feature = current_feature
-
-feature = st.session_state.saved_feature
+    feature = current_feature
+else:
+    feature = st.session_state.saved_feature
 
 st.markdown("---")
 # STATS & COUNTS FOR SELECTED REGION (MAIN CYGNSS ONLY, IF SELECTED)
