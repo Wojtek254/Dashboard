@@ -626,42 +626,6 @@ def _download_ee_npy(image, region):
     return np.load(io.BytesIO(payload), allow_pickle=False)
 
 
-def _download_day_arrays_adaptive(day_image_pairs, region):
-    """Download a stack, recursively splitting it when EE rejects the request.
-
-    getDownloadURL is intended for small image chunks and has strict request
-    limits. A bbox that is fine for a few dates can be too large when many
-    dates are concatenated into bands. Instead of relying on one fixed chunk
-    size, try the whole chunk first and bisect it on an Earth Engine download
-    error. This keeps small regions fast while making larger regions robust.
-
-    Returns an ordered list of (day_key, 2-D ndarray) pairs.
-    """
-    if not day_image_pairs:
-        return []
-
-    days = [day for day, _ in day_image_pairs]
-    images = [img for _, img in day_image_pairs]
-
-    try:
-        stack_img = ee.Image.cat(images).clip(region)
-        npy = _download_ee_npy(stack_img, region)
-        arrays = _npy_to_band_arrays(npy, len(images))
-        return list(zip(days, arrays))
-    except ee.EEException as exc:
-        if len(day_image_pairs) == 1:
-            raise RuntimeError(
-                "Earth Engine could not download even a single-day crop for the "
-                "selected rectangle. Try drawing a smaller rectangle. "
-                f"EE error: {exc}"
-            ) from exc
-
-        mid = len(day_image_pairs) // 2
-        left = _download_day_arrays_adaptive(day_image_pairs[:mid], region)
-        right = _download_day_arrays_adaptive(day_image_pairs[mid:], region)
-        return left + right
-
-
 def _npy_to_band_arrays(arr, expected_count):
     """Normalize EE's NPY response into an ordered list of 2-D arrays."""
     if arr.dtype.names:
@@ -721,29 +685,27 @@ def compute_region_stats_local(
     for chunk_start in range(0, len(selected_days), DOWNLOAD_DAYS_PER_CHUNK):
         chunk_days = selected_days[chunk_start:chunk_start + DOWNLOAD_DAYS_PER_CHUNK]
 
-        day_image_pairs = []
+        images = []
         for day in chunk_days:
             info = DAY_KEY_TO_INFO.get(day)
             if info is None:
                 continue
-            day_image_pairs.append(
-                (
-                    day,
-                    ee.Image(info["asset_id"])
-                    .select(band_index)
-                    .rename(f"d_{day}"),
-                )
+            images.append(
+                ee.Image(info["asset_id"])
+                .select(band_index)
+                .rename(f"d_{day}")
             )
 
-        if not day_image_pairs:
+        if not images:
             continue
 
-        # Try a reasonably large batch first. If getDownloadURL rejects it
-        # because the crop is too large, recursively split the batch until it
-        # fits. This avoids a fragile fixed number of days per request.
-        downloaded = _download_day_arrays_adaptive(day_image_pairs, region)
+        # The rectangle is applied before download, so only the small requested
+        # subset is transferred to the Streamlit server.
+        stack_img = ee.Image.cat(images).clip(region)
+        npy = _download_ee_npy(stack_img, region)
+        arrays = _npy_to_band_arrays(npy, len(images))
 
-        for day, raw in downloaded:
+        for day, raw in zip(chunk_days, arrays):
             raw = np.asarray(raw)
             valid = raw < 255
 
