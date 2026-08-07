@@ -900,40 +900,17 @@ def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, position, bot
     )
 
 
-WORLD_PREVIEW_BOUNDS = [[-85.0, -180.0], [85.0, 180.0]]
-WORLD_PREVIEW_REGION = ee.Geometry.Rectangle([-180.0, -85.0, 180.0, 85.0], geodesic=False)
-WORLD_PREVIEW_DIMENSIONS = "8192x4096"
-
-
 def ee_tile_url(visual_image):
-    """Resolve an Earth Engine visualization to a high-resolution tile URL."""
+    """Resolve an Earth Engine visualization to a tile URL once."""
     map_id = visual_image.getMapId({})
     return map_id["tile_fetcher"].url_format
 
 
-def ee_global_preview_url(visual_image):
-    """Return one cached-friendly global PNG for fast map display.
-
-    The preview covers the whole usable Web-Mercator world. It is only a
-    display product; statistics still use the original Earth Engine assets.
-    """
-    return visual_image.getThumbURL(
-        {
-            "region": WORLD_PREVIEW_REGION,
-            "dimensions": WORLD_PREVIEW_DIMENSIONS,
-            "format": "png",
-            "crs": "EPSG:4326",
-        }
-    )
-
-
-def build_map_from_previews(
-    left_preview_url,
+def build_map_from_tiles(
     left_tile_url,
     left_label,
     map_center=None,
     map_zoom=None,
-    right_preview_url=None,
     right_tile_url=None,
     right_label=None,
     left_shading_layer="none",
@@ -945,11 +922,11 @@ def build_map_from_previews(
     right_thr_min=None,
     right_thr_max=None,
 ):
-    """Build the map from one global preview image per side.
+    """Build a fresh Folium object from already-resolved tile URLs.
 
-    This keeps the complete world available while avoiding dozens of Earth
-    Engine tile requests for the normal display. The original EE tile layer is
-    also present (hidden by default) as an optional full-resolution overlay.
+    A fresh Folium object is intentional. st_folium mutates Folium objects while
+    generating its Leaflet script, so reusing the same folium.Map from
+    session_state can change the component hash and remount the map.
     """
     try:
         if map_center is None:
@@ -959,56 +936,28 @@ def build_map_from_previews(
 
         m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
 
-        left_layer = folium.raster_layers.ImageOverlay(
-            image=left_preview_url,
-            bounds=WORLD_PREVIEW_BOUNDS,
-            opacity=1.0,
-            name=f"{left_label} | fast global preview",
+        left_layer = folium.TileLayer(
+            tiles=left_tile_url,
+            attr="Google Earth Engine",
+            name=left_label,
             overlay=True,
             control=True,
-            cross_origin=True,
-            zindex=2,
         )
         left_layer.add_to(m)
 
-        # Optional native-resolution EE tiles. Hidden initially so the browser
-        # does not request them until the user explicitly enables the layer.
-        if left_tile_url:
-            folium.TileLayer(
-                tiles=left_tile_url,
-                attr="Google Earth Engine",
-                name=f"{left_label} | high-resolution EE tiles",
-                overlay=True,
-                control=True,
-                show=False,
-            ).add_to(m)
-
-        if right_preview_url is not None:
+        if right_tile_url is not None:
             if right_label is None:
                 right_label = "SECONDARY layer"
 
-            right_layer = folium.raster_layers.ImageOverlay(
-                image=right_preview_url,
-                bounds=WORLD_PREVIEW_BOUNDS,
-                opacity=1.0,
-                name=f"{right_label} | fast global preview",
+            right_layer = folium.TileLayer(
+                tiles=right_tile_url,
+                attr="Google Earth Engine",
+                name=right_label,
                 overlay=True,
                 control=True,
-                cross_origin=True,
-                zindex=2,
             )
             right_layer.add_to(m)
             SideBySideLayers(left_layer, right_layer).add_to(m)
-
-            if right_tile_url:
-                folium.TileLayer(
-                    tiles=right_tile_url,
-                    attr="Google Earth Engine",
-                    name=f"{right_label} | high-resolution EE tiles",
-                    overlay=True,
-                    control=True,
-                    show=False,
-                ).add_to(m)
 
         Draw(
             export=False,
@@ -1038,7 +987,7 @@ def build_map_from_previews(
             position="left", bottom="260px", role="contour"
         )
 
-        if right_preview_url is not None:
+        if right_tile_url is not None:
             add_layer_colorbar(
                 m, "SECONDARY", right_shading_layer, right_thr_min, right_thr_max,
                 position="right", bottom="40px", role="shading"
@@ -1371,15 +1320,9 @@ if "map_center" not in st.session_state:
 if "map_zoom" not in st.session_state:
     st.session_state.map_zoom = ZOOM
 
-# Cache only display URLs, never the Folium map itself. The global preview URL
-# is the normal display layer; native EE tiles remain available as an optional
-# high-resolution overlay.
+# Cache only Earth Engine tile URLs, never the Folium map itself.
 if "map_tile_signature" not in st.session_state:
     st.session_state.map_tile_signature = None
-if "left_preview_url" not in st.session_state:
-    st.session_state.left_preview_url = None
-if "right_preview_url" not in st.session_state:
-    st.session_state.right_preview_url = None
 if "left_tile_url" not in st.session_state:
     st.session_state.left_tile_url = None
 if "right_tile_url" not in st.session_state:
@@ -1583,9 +1526,9 @@ if split_view and right_start_date is not None:
 # ---------------------------------------------
 # BUILD / DISPLAY MAP
 # ---------------------------------------------
-# Resolve one global preview URL (plus optional native EE tiles) only when
-# map-defining controls change. Drawing a rectangle does NOT change this
-# signature, so the display image is reused on the drawing-triggered rerun.
+# Resolve Earth Engine tile URLs only when map-defining controls change.
+# Drawing a rectangle does NOT change this signature, so no new EE map request
+# is made on the drawing-triggered rerun.
 map_signature = (
     bool(split_view),
     left_shading_layer,
@@ -1601,7 +1544,7 @@ map_signature = (
 )
 
 if (
-    st.session_state.left_preview_url is None
+    st.session_state.left_tile_url is None
     or st.session_state.map_tile_signature != map_signature
 ):
     try:
@@ -1614,15 +1557,11 @@ if (
             shading_layer=left_shading_layer,
             contour_layer=left_contour_layer,
         )
-        # One global PNG is the normal display layer. The native tile URL is
-        # resolved at the same time but stays hidden until explicitly enabled.
-        st.session_state.left_preview_url = ee_global_preview_url(left_visual_image)
         st.session_state.left_tile_url = ee_tile_url(left_visual_image)
     except Exception as e:
         st.error(f"Failed to build MAIN image: {e}")
         st.stop()
 
-    st.session_state.right_preview_url = None
     st.session_state.right_tile_url = None
     if split_view and right_sel_days is not None:
         try:
@@ -1635,7 +1574,6 @@ if (
                 shading_layer=right_shading_layer,
                 contour_layer=right_contour_layer,
             )
-            st.session_state.right_preview_url = ee_global_preview_url(right_visual_image)
             st.session_state.right_tile_url = ee_tile_url(right_visual_image)
         except Exception as e:
             st.error(f"Failed to build SECONDARY image: {e}")
@@ -1643,15 +1581,14 @@ if (
 
     st.session_state.map_tile_signature = map_signature
 
-# Build a fresh Folium wrapper from stable preview URLs. The preview covers the
-# whole world; CENTER/ZOOM only determine the initial viewport (Sumatra).
-m = build_map_from_previews(
-    left_preview_url=st.session_state.left_preview_url,
+# Build a fresh Folium wrapper from stable tile URLs. Because its generated
+# base script is unchanged on a drawing-only rerun, st_folium keeps the same
+# frontend Leaflet map instead of remounting it.
+m = build_map_from_tiles(
     left_tile_url=st.session_state.left_tile_url,
     left_label=left_label,
     map_center=st.session_state.map_center,
     map_zoom=st.session_state.map_zoom,
-    right_preview_url=st.session_state.right_preview_url if split_view else None,
     right_tile_url=st.session_state.right_tile_url if split_view else None,
     right_label=right_label,
     left_shading_layer=left_shading_layer,
