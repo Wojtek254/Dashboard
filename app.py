@@ -35,8 +35,8 @@ ASSET_FOLDER = f"projects/{PROJECT_ID}/assets"
 # e.g. inundation_5bands_2025_305
 ASSET_NAME_RE = re.compile(r"^inundation_5bands_(\d{4})_(\d{1,3})$")
 
-CENTER = [0, 0]
-ZOOM = 2
+CENTER = [0.5, 108.0]
+ZOOM = 4
 
 # Color palette for inundation
 PALETTE_INUND = [
