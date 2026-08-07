@@ -871,13 +871,18 @@ def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, position, bot
     )
 
 
-def build_map(
-    left_visual_image,
+def ee_tile_url(visual_image):
+    """Resolve an Earth Engine visualization to a tile URL once."""
+    map_id = visual_image.getMapId({})
+    return map_id["tile_fetcher"].url_format
+
+
+def build_map_from_tiles(
+    left_tile_url,
     left_label,
-    saved_feature=None,
     map_center=None,
     map_zoom=None,
-    right_visual_image=None,
+    right_tile_url=None,
     right_label=None,
     left_shading_layer="none",
     left_contour_layer="none",
@@ -888,6 +893,12 @@ def build_map(
     right_thr_min=None,
     right_thr_max=None,
 ):
+    """Build a fresh Folium object from already-resolved tile URLs.
+
+    A fresh Folium object is intentional. st_folium mutates Folium objects while
+    generating its Leaflet script, so reusing the same folium.Map from
+    session_state can change the component hash and remount the map.
+    """
     try:
         if map_center is None:
             map_center = CENTER
@@ -895,9 +906,6 @@ def build_map(
             map_zoom = ZOOM
 
         m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
-
-        left_map_id = left_visual_image.getMapId({})
-        left_tile_url = left_map_id["tile_fetcher"].url_format
 
         left_layer = folium.TileLayer(
             tiles=left_tile_url,
@@ -908,10 +916,7 @@ def build_map(
         )
         left_layer.add_to(m)
 
-        if right_visual_image is not None:
-            right_map_id = right_visual_image.getMapId({})
-            right_tile_url = right_map_id["tile_fetcher"].url_format
-
+        if right_tile_url is not None:
             if right_label is None:
                 right_label = "SECONDARY layer"
 
@@ -944,18 +949,6 @@ def build_map(
             edit_options={"edit": True, "remove": True},
         ).add_to(m)
 
-        if saved_feature is not None:
-            folium.GeoJson(
-                saved_feature,
-                name="Selected region",
-                style_function=lambda x: {
-                    "color": "#ff8800",
-                    "weight": 2,
-                    "fillColor": "#ff8800",
-                    "fillOpacity": 0.15,
-                },
-            ).add_to(m)
-
         add_layer_colorbar(
             m, "MAIN", left_shading_layer, left_thr_min, left_thr_max,
             position="left", bottom="40px", role="shading"
@@ -965,7 +958,7 @@ def build_map(
             position="left", bottom="260px", role="contour"
         )
 
-        if right_visual_image is not None:
+        if right_tile_url is not None:
             add_layer_colorbar(
                 m, "SECONDARY", right_shading_layer, right_thr_min, right_thr_max,
                 position="right", bottom="40px", role="shading"
@@ -981,6 +974,29 @@ def build_map(
     except Exception as e:
         st.error(f"Earth Engine map rendering failed: {e}")
         st.stop()
+
+
+def saved_region_feature_group(feature):
+    """Dynamic overlay for the saved rectangle.
+
+    Passed through st_folium(feature_group_to_add=...), so changing the
+    rectangle does not remount/reload the base Leaflet map.
+    """
+    if feature is None:
+        return None
+
+    fg = folium.FeatureGroup(name="Selected region", show=True)
+    folium.GeoJson(
+        feature,
+        name="Selected region",
+        style_function=lambda x: {
+            "color": "#ff8800",
+            "weight": 2,
+            "fillColor": "#ff8800",
+            "fillOpacity": 0.15,
+        },
+    ).add_to(fg)
+    return fg
 # ALTAIR PLOT – MIN / MAX / MEAN
 # ---------------------------------------------
 def plot_timeseries(df, title, kind, thr_max):
@@ -1275,23 +1291,32 @@ if "map_center" not in st.session_state:
 if "map_zoom" not in st.session_state:
     st.session_state.map_zoom = ZOOM
 
-# Keep the Folium object stable across reruns caused only by drawing.
-# This prevents st_folium from receiving a freshly rebuilt map every time
-# a rectangle is created/edited.
-if "folium_map" not in st.session_state:
-    st.session_state.folium_map = None
-
-if "folium_map_signature" not in st.session_state:
-    st.session_state.folium_map_signature = None
-
+# Cache only Earth Engine tile URLs, never the Folium map itself.
+if "map_tile_signature" not in st.session_state:
+    st.session_state.map_tile_signature = None
+if "left_tile_url" not in st.session_state:
+    st.session_state.left_tile_url = None
+if "right_tile_url" not in st.session_state:
+    st.session_state.right_tile_url = None
 if "map_revision" not in st.session_state:
     st.session_state.map_revision = 0
 
+# st_folium copies its newest component value into session_state[key] in its
+# internal on_change callback BEFORE the script reruns. Read that value now,
+# before constructing/rendering the map, so the rectangle is already known on
+# the drawing-triggered rerun.
+component_key = f"cygnss_map_{st.session_state.map_revision}"
+_previous_map_state = st.session_state.get(component_key)
+_previous_feature = extract_feature_from_map_state(_previous_map_state)
+if _previous_feature and "geometry" in _previous_feature:
+    st.session_state.saved_feature = _previous_feature
+
 if st.button("Clear selected region"):
     st.session_state.saved_feature = None
-    st.session_state.folium_map = None
-    st.session_state.folium_map_signature = None
     st.session_state.map_revision += 1
+    # Changing the component key intentionally remounts the map only for Clear,
+    # which also clears Leaflet.Draw's internal drawnItems layer.
+    component_key = f"cygnss_map_{st.session_state.map_revision}"
 
 split_view = st.checkbox(
     "Enable split-view map comparison (MAIN vs SECONDARY)",
@@ -1472,12 +1497,9 @@ if split_view and right_start_date is not None:
 # ---------------------------------------------
 # BUILD / DISPLAY MAP
 # ---------------------------------------------
-# A map interaction (especially drawing a rectangle) causes Streamlit to rerun
-# the script. Rebuilding the Folium object on that rerun makes Leaflet reload,
-# which removes the just-drawn rectangle from the browser.
-#
-# Therefore the map is rebuilt ONLY when map-defining controls change. On a
-# drawing-only rerun we reuse the exact same Folium object from session_state.
+# Resolve Earth Engine tile URLs only when map-defining controls change.
+# Drawing a rectangle does NOT change this signature, so no new EE map request
+# is made on the drawing-triggered rerun.
 map_signature = (
     bool(split_view),
     left_shading_layer,
@@ -1490,14 +1512,12 @@ map_signature = (
     tuple(right_sel_days) if split_view and right_sel_days is not None else (),
     float(right_thr_min) if right_thr_min is not None else None,
     float(right_thr_max) if right_thr_max is not None else None,
-    st.session_state.map_revision,
 )
 
 if (
-    st.session_state.folium_map is None
-    or st.session_state.folium_map_signature != map_signature
+    st.session_state.left_tile_url is None
+    or st.session_state.map_tile_signature != map_signature
 ):
-    # Build Earth Engine visualizations only when the actual map settings changed.
     try:
         left_visual_image = build_side_visual_image(
             selected_days=left_sel_days,
@@ -1508,11 +1528,12 @@ if (
             shading_layer=left_shading_layer,
             contour_layer=left_contour_layer,
         )
+        st.session_state.left_tile_url = ee_tile_url(left_visual_image)
     except Exception as e:
         st.error(f"Failed to build MAIN image: {e}")
         st.stop()
 
-    right_visual_image = None
+    st.session_state.right_tile_url = None
     if split_view and right_sel_days is not None:
         try:
             right_visual_image = build_side_visual_image(
@@ -1524,43 +1545,47 @@ if (
                 shading_layer=right_shading_layer,
                 contour_layer=right_contour_layer,
             )
+            st.session_state.right_tile_url = ee_tile_url(right_visual_image)
         except Exception as e:
             st.error(f"Failed to build SECONDARY image: {e}")
             st.stop()
 
-    st.session_state.folium_map = build_map(
-        left_visual_image=left_visual_image,
-        left_label=left_label,
-        saved_feature=st.session_state.saved_feature,
-        map_center=st.session_state.map_center,
-        map_zoom=st.session_state.map_zoom,
-        right_visual_image=right_visual_image,
-        right_label=right_label,
-        left_shading_layer=left_shading_layer,
-        left_contour_layer=left_contour_layer,
-        right_shading_layer=right_shading_layer if split_view else "none",
-        right_contour_layer=right_contour_layer if split_view else "none",
-        left_thr_min=left_thr_min,
-        left_thr_max=left_thr_max,
-        right_thr_min=right_thr_min,
-        right_thr_max=right_thr_max,
-    )
-    st.session_state.folium_map_signature = map_signature
+    st.session_state.map_tile_signature = map_signature
 
-m = st.session_state.folium_map
+# Build a fresh Folium wrapper from stable tile URLs. Because its generated
+# base script is unchanged on a drawing-only rerun, st_folium keeps the same
+# frontend Leaflet map instead of remounting it.
+m = build_map_from_tiles(
+    left_tile_url=st.session_state.left_tile_url,
+    left_label=left_label,
+    map_center=st.session_state.map_center,
+    map_zoom=st.session_state.map_zoom,
+    right_tile_url=st.session_state.right_tile_url if split_view else None,
+    right_label=right_label,
+    left_shading_layer=left_shading_layer,
+    left_contour_layer=left_contour_layer,
+    right_shading_layer=right_shading_layer if split_view else "none",
+    right_contour_layer=right_contour_layer if split_view else "none",
+    left_thr_min=left_thr_min,
+    left_thr_max=left_thr_max,
+    right_thr_min=right_thr_min,
+    right_thr_max=right_thr_max,
+)
 
-# Only drawing changes are returned to Streamlit. Panning/zooming therefore do
-# not cause unnecessary Python reruns and do not rebuild the Earth Engine map.
+# The saved region is sent separately from the base map. streamlit-folium
+# updates feature_group_to_add dynamically without reloading the map.
+region_fg = saved_region_feature_group(st.session_state.saved_feature)
+
 map_state = st_folium(
     m,
     height=650,
     width=None,
-    key="cygnss_map",
+    key=component_key,
     returned_objects=["last_active_drawing", "all_drawings"],
+    feature_group_to_add=region_fg,
 )
 
 current_feature = extract_feature_from_map_state(map_state)
-
 if current_feature and "geometry" in current_feature:
     st.session_state.saved_feature = current_feature
     feature = current_feature
