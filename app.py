@@ -88,11 +88,11 @@ LAYER_OPTIONS = {
 
 OVERLAY_LEGENDS = {
     "chirps": {
-        "title": "CHIRPS precipitation",
+        "title": "Mean CHIRPS precipitation",
         "palette": ["#f7fbff", "#6baed6", "#2171b5", "#08306b"],
         "min": 0,
         "max": 20,
-        "unit": "mm",
+        "unit": "mm/day",
     },
     "ndvi": {
         "title": "NDVI",
@@ -484,7 +484,7 @@ def build_external_layer_image(layer_name, start_date, end_date, mode="shading")
             ee.ImageCollection(CHIRPS_COLLECTION)
             .filterDate(start_str, end_exclusive)
             .select("precipitation")
-            .sum()
+            .mean()
         )
         vis = OVERLAY_LEGENDS["chirps"]
 
