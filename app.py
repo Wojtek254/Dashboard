@@ -1248,12 +1248,54 @@ def render_fullpage_screenshot_button():
             return new Promise(resolve => setTimeout(resolve, ms));
           }
 
+          function findScrollableMain(doc) {
+            const preferredSelectors = [
+              '[data-testid="stMain"]',
+              '.stMain',
+              'section.main',
+              '[data-testid="stAppViewContainer"]'
+            ];
+
+            for (const selector of preferredSelectors) {
+              const element = doc.querySelector(selector);
+              if (element && element.scrollHeight > element.clientHeight + 20) {
+                return element;
+              }
+            }
+
+            const candidates = Array.from(doc.querySelectorAll('main, section, div'))
+              .filter(element => {
+                const rect = element.getBoundingClientRect();
+                const style = doc.defaultView.getComputedStyle(element);
+                const scrollable = ['auto', 'scroll', 'overlay'].includes(style.overflowY);
+                return scrollable && element.scrollHeight > element.clientHeight + 20
+                  && rect.width > 400 && rect.height > 300;
+              })
+              .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+
+            return candidates[0] || doc.scrollingElement || doc.documentElement;
+          }
+
           async function capture() {
             const status = document.getElementById("capture_status");
             const parentWindow = window.parent;
-            const originalX = parentWindow.scrollX;
-            const originalY = parentWindow.scrollY;
+            const parentDocument = parentWindow.document;
+            const scrollContainer = findScrollableMain(parentDocument);
+            const usesWindowScroll = scrollContainer === parentDocument.scrollingElement
+              || scrollContainer === parentDocument.documentElement
+              || scrollContainer === parentDocument.body;
+            const originalX = usesWindowScroll ? parentWindow.scrollX : scrollContainer.scrollLeft;
+            const originalY = usesWindowScroll ? parentWindow.scrollY : scrollContainer.scrollTop;
             let stream = null;
+
+            function setScrollPosition(x, y) {
+              if (usesWindowScroll) {
+                parentWindow.scrollTo(x, y);
+              } else {
+                scrollContainer.scrollLeft = x;
+                scrollContainer.scrollTop = y;
+              }
+            }
 
             try {
               const mediaDevices = parentWindow.navigator.mediaDevices;
@@ -1283,14 +1325,38 @@ def render_fullpage_screenshot_button():
               await video.play();
               await wait(500);
 
-              const pageWidth = parentWindow.document.documentElement.scrollWidth;
-              const pageHeight = parentWindow.document.documentElement.scrollHeight;
-              const viewportWidth = parentWindow.innerWidth;
-              const viewportHeight = parentWindow.innerHeight;
+              const containerRect = usesWindowScroll
+                ? { left: 0, top: 0, width: parentWindow.innerWidth, height: parentWindow.innerHeight }
+                : scrollContainer.getBoundingClientRect();
+              const pageWidth = Math.round(
+                usesWindowScroll ? parentDocument.documentElement.scrollWidth : scrollContainer.clientWidth
+              );
+              const pageHeight = Math.round(
+                usesWindowScroll ? parentDocument.documentElement.scrollHeight : scrollContainer.scrollHeight
+              );
+              const viewportWidth = Math.round(containerRect.width);
+              const viewportHeight = Math.round(containerRect.height);
+
+              if (pageHeight <= viewportHeight + 20) {
+                throw new Error("The full scrollable Streamlit page could not be detected.");
+              }
+
+              const frameScaleX = video.videoWidth / parentWindow.innerWidth;
+              const frameScaleY = video.videoHeight / parentWindow.innerHeight;
+              const sourceX = Math.max(0, Math.round(containerRect.left * frameScaleX));
+              const sourceY = Math.max(0, Math.round(containerRect.top * frameScaleY));
+              const sourceWidth = Math.min(
+                video.videoWidth - sourceX,
+                Math.round(containerRect.width * frameScaleX)
+              );
+              const sourceHeight = Math.min(
+                video.videoHeight - sourceY,
+                Math.round(containerRect.height * frameScaleY)
+              );
 
               const nativeScale = Math.min(
-                video.videoWidth / viewportWidth,
-                video.videoHeight / viewportHeight
+                sourceWidth / viewportWidth,
+                sourceHeight / viewportHeight
               );
               const maxDimensionScale = Math.min(16000 / pageWidth, 16000 / pageHeight);
               const maxAreaScale = Math.sqrt(24000000 / (pageWidth * pageHeight));
@@ -1312,14 +1378,14 @@ def render_fullpage_screenshot_button():
               for (let i = 0; i < uniquePositions.length; i++) {
                 const y = uniquePositions[i];
                 status.textContent = `Capturing ${i + 1}/${uniquePositions.length}...`;
-                parentWindow.scrollTo(0, y);
-                await wait(450);
+                setScrollPosition(0, y);
+                await wait(600);
                 context.drawImage(
                   video,
-                  0,
-                  0,
-                  video.videoWidth,
-                  video.videoHeight,
+                  sourceX,
+                  sourceY,
+                  sourceWidth,
+                  sourceHeight,
                   0,
                   Math.round(y * outputScale),
                   Math.round(viewportWidth * outputScale),
@@ -1327,7 +1393,7 @@ def render_fullpage_screenshot_button():
                 );
               }
 
-              parentWindow.scrollTo(originalX, originalY);
+              setScrollPosition(originalX, originalY);
               stream.getTracks().forEach(t => t.stop());
               stream = null;
 
@@ -1345,7 +1411,7 @@ def render_fullpage_screenshot_button():
                 status.textContent = "PNG downloaded.";
               }, "image/png");
             } catch (e) {
-              parentWindow.scrollTo(originalX, originalY);
+              setScrollPosition(originalX, originalY);
               if (stream) stream.getTracks().forEach(t => t.stop());
               status.textContent = e.name === "NotAllowedError"
                 ? "Capture cancelled or blocked by the browser."
