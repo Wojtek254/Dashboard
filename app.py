@@ -1138,22 +1138,36 @@ def plot_pixelcount_timeseries(df, title):
 
 
 def build_png_report(view_info, stats_info):
-    width, height = 2400, 1400
+    width, height = 2400, 1750
     img = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(img)
-    font_title = ImageFont.load_default()
-    font_body = ImageFont.load_default()
+
+    try:
+        font_title = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42
+        )
+        font_section = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30
+        )
+        font_body = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 25
+        )
+    except OSError:
+        font_title = ImageFont.load_default()
+        font_section = font_title
+        font_body = font_title
 
     y = 40
     left_margin = 60
-    line_h = 38
+    line_h = 42
 
     draw.text((left_margin, y), "CYGNSS Viewer — Snapshot report", fill="black", font=font_title)
     y += line_h * 2
 
     header_lines = [
-        f"MAIN: {view_info['left_label']}",
-        f"SECONDARY: {view_info['right_label']}",
+        f"Generated (UTC): {view_info['generated_utc']}",
+        f"MAIN date range: {view_info['left_date_range']} ({view_info['left_days_used']} data days used)",
+        f"SECONDARY date range: {view_info['right_date_range']}",
         f"Map center: {view_info['map_center'][0]:.4f}, {view_info['map_center'][1]:.4f} | zoom: {view_info['map_zoom']}",
         f"MAIN shading: {view_info['left_shading']}",
         f"MAIN contour: {view_info['left_contour']}",
@@ -1165,13 +1179,18 @@ def build_png_report(view_info, stats_info):
         y += line_h
 
     y += line_h
-    draw.text((left_margin, y), "MAIN statistics", fill="black", font=font_title)
+    draw.text((left_margin, y), "MAIN area analysis", fill="black", font=font_section)
     y += line_h * 2
 
     rows = [
-        ("Stats source", "MAIN asset layer only"),
+        ("Statistics source", stats_info["source"]),
+        ("Analysis date range", stats_info["date_range"]),
         ("Threshold range", f"{stats_info['thr_min']} → {stats_info['thr_max']}"),
         ("Region drawn", stats_info["region_drawn"]),
+        ("Rectangle west longitude", stats_info["west_lon"]),
+        ("Rectangle east longitude", stats_info["east_lon"]),
+        ("Rectangle south latitude", stats_info["south_lat"]),
+        ("Rectangle north latitude", stats_info["north_lat"]),
         ("Min", stats_info["min"]),
         ("Max", stats_info["max"]),
         ("Mean", stats_info["mean"]),
@@ -1182,7 +1201,7 @@ def build_png_report(view_info, stats_info):
     col1_x = left_margin
     col2_x = 800
     table_top = y - 14
-    row_h = 48
+    row_h = 58
     table_w = 2000
     table_h = row_h * (len(rows) + 1)
 
@@ -1200,8 +1219,8 @@ def build_png_report(view_info, stats_info):
         yline = table_top + i * row_h
         draw.line([col1_x - 20, yline, col1_x - 20 + table_w, yline], fill="black", width=1)
 
-    draw.text((col1_x, table_top + 10), "Metric", fill="black", font=font_title)
-    draw.text((col2_x, table_top + 10), "Value", fill="black", font=font_title)
+    draw.text((col1_x, table_top + 12), "Parameter", fill="black", font=font_section)
+    draw.text((col2_x, table_top + 12), "Value", fill="black", font=font_section)
 
     for idx, (k, v) in enumerate(rows, start=1):
         yrow = table_top + idx * row_h + 10
@@ -1220,51 +1239,103 @@ def render_fullpage_screenshot_button():
         <div style="padding:8px 0;">
           <button id="capture_full_page_png"
             style="background:#0b57d0;color:#fff;border:none;padding:10px 16px;border-radius:8px;cursor:pointer;font-weight:600;">
-            Download FULL page PNG (printscreen)
+            Capture FULL dashboard as PNG
           </button>
           <span id="capture_status" style="margin-left:10px;font-family:sans-serif;font-size:12px;color:#333;"></span>
         </div>
         <script>
-          async function loadHtml2Canvas() {
-            if (window.html2canvas) return window.html2canvas;
-            return new Promise((resolve, reject) => {
-              const s = document.createElement("script");
-              s.src = "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js";
-              s.onload = () => resolve(window.html2canvas);
-              s.onerror = reject;
-              document.head.appendChild(s);
-            });
+          function wait(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
           }
 
           async function capture() {
             const status = document.getElementById("capture_status");
+            const parentWindow = window.parent;
+            const originalX = parentWindow.scrollX;
+            const originalY = parentWindow.scrollY;
+            let stream = null;
+
             try {
-              status.textContent = "Preparing screenshot...";
-              const h2c = await loadHtml2Canvas();
-              const target = window.parent.document.body;
-              const desiredScale = Math.max(2, window.parent.devicePixelRatio || 2);
-              const maxDim = 8000; // keep file safe for viewers
-              const rawW = target.scrollWidth * desiredScale;
-              const rawH = target.scrollHeight * desiredScale;
-              const limiter = Math.max(rawW / maxDim, rawH / maxDim, 1);
-              const scale = desiredScale / limiter;
-              const canvas = await h2c(target, {
-                useCORS: true,
-                allowTaint: true,
-                backgroundColor: "#ffffff",
-                scale: scale,
-                windowWidth: target.scrollWidth,
-                windowHeight: target.scrollHeight,
-                width: target.scrollWidth,
-                height: target.scrollHeight,
-                scrollX: 0,
-                scrollY: 0
+              const mediaDevices = parentWindow.navigator.mediaDevices;
+              if (!mediaDevices || !mediaDevices.getDisplayMedia) {
+                throw new Error("Screen capture is not supported by this browser.");
+              }
+
+              status.textContent = "Select this browser tab in the sharing window...";
+              stream = await mediaDevices.getDisplayMedia({
+                video: { displaySurface: "browser" },
+                audio: false,
+                preferCurrentTab: true,
+                selfBrowserSurface: "include",
+                surfaceSwitching: "exclude"
               });
+
+              const track = stream.getVideoTracks()[0];
+              const displaySurface = track.getSettings().displaySurface;
+              if (displaySurface && displaySurface !== "browser") {
+                throw new Error("Please select the current browser tab, not a window or screen.");
+              }
+
+              const video = document.createElement("video");
+              video.srcObject = stream;
+              video.muted = true;
+              video.playsInline = true;
+              await video.play();
+              await wait(500);
+
+              const pageWidth = parentWindow.document.documentElement.scrollWidth;
+              const pageHeight = parentWindow.document.documentElement.scrollHeight;
+              const viewportWidth = parentWindow.innerWidth;
+              const viewportHeight = parentWindow.innerHeight;
+
+              const nativeScale = Math.min(
+                video.videoWidth / viewportWidth,
+                video.videoHeight / viewportHeight
+              );
+              const maxDimensionScale = Math.min(16000 / pageWidth, 16000 / pageHeight);
+              const maxAreaScale = Math.sqrt(24000000 / (pageWidth * pageHeight));
+              const outputScale = Math.min(nativeScale, maxDimensionScale, maxAreaScale, 2);
+
+              const canvas = document.createElement("canvas");
+              canvas.width = Math.max(1, Math.round(pageWidth * outputScale));
+              canvas.height = Math.max(1, Math.round(pageHeight * outputScale));
+              const context = canvas.getContext("2d");
+              context.fillStyle = "#ffffff";
+              context.fillRect(0, 0, canvas.width, canvas.height);
+
+              const positions = [];
+              for (let y = 0; y < pageHeight; y += viewportHeight) {
+                positions.push(Math.min(y, Math.max(0, pageHeight - viewportHeight)));
+              }
+              const uniquePositions = [...new Set(positions)];
+
+              for (let i = 0; i < uniquePositions.length; i++) {
+                const y = uniquePositions[i];
+                status.textContent = `Capturing ${i + 1}/${uniquePositions.length}...`;
+                parentWindow.scrollTo(0, y);
+                await wait(450);
+                context.drawImage(
+                  video,
+                  0,
+                  0,
+                  video.videoWidth,
+                  video.videoHeight,
+                  0,
+                  Math.round(y * outputScale),
+                  Math.round(viewportWidth * outputScale),
+                  Math.round(viewportHeight * outputScale)
+                );
+              }
+
+              parentWindow.scrollTo(originalX, originalY);
+              stream.getTracks().forEach(t => t.stop());
+              stream = null;
+
               const a = document.createElement("a");
               a.download = "dashboard_fullpage_screenshot.png";
               canvas.toBlob((blob) => {
                 if (!blob) {
-                  status.textContent = "Screenshot failed: empty PNG blob.";
+                  status.textContent = "Screenshot failed while creating the PNG.";
                   return;
                 }
                 const url = URL.createObjectURL(blob);
@@ -1274,7 +1345,11 @@ def render_fullpage_screenshot_button():
                 status.textContent = "PNG downloaded.";
               }, "image/png");
             } catch (e) {
-              status.textContent = "Screenshot failed (browser CORS/security).";
+              parentWindow.scrollTo(originalX, originalY);
+              if (stream) stream.getTracks().forEach(t => t.stop());
+              status.textContent = e.name === "NotAllowedError"
+                ? "Capture cancelled or blocked by the browser."
+                : `Screenshot failed: ${e.message}`;
             }
           }
 
@@ -1619,6 +1694,7 @@ left_sel_days_tuple = tuple(left_sel_days)
 pixel_count_inrange = None
 pixel_count_total = None
 region_drawn = "No"
+region_bounds = None
 
 if left_cygnss_layer is None:
     st.info("No CYGNSS layer is selected on MAIN. Statistics are currently calculated only for a selected MAIN CYGNSS layer.")
@@ -1640,6 +1716,7 @@ else:
             lats = [c[1] for c in ring]
             xmin, xmax = min(lons), max(lons)
             ymin, ymax = min(lats), max(lats)
+            region_bounds = (xmin, ymin, xmax, ymax)
 
             user_min, user_max, user_mean = compute_region_summary_for_bbox(
                 left_sel_days_tuple,
@@ -1723,14 +1800,24 @@ else:
         st.info("Draw a rectangular area on the map using the drawing tool (rectangle icon in the top-left corner).")
 
 st.markdown("---")
-st.subheader("Export PNG")
-st.caption("Use full-page screenshot first (captures map + charts + stats). If browser blocks it, use fallback report PNG.")
-
-render_fullpage_screenshot_button()
+st.subheader("Export")
+st.caption(
+    "Download the analysis report for dates, rectangle coordinates, configuration, and statistics. "
+    "For a visual copy of the complete dashboard, use the screenshot button and select this browser tab."
+)
 
 view_info = {
-    "left_label": left_label,
-    "right_label": right_label if right_label is not None else "Split view disabled",
+    "generated_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+    "left_date_range": (
+        f"{left_start_date.strftime('%Y-%m-%d')} to {left_end_date.strftime('%Y-%m-%d')}"
+    ),
+    "left_days_used": len(left_sel_days),
+    "right_date_range": (
+        f"{right_start_date.strftime('%Y-%m-%d')} to {right_end_date.strftime('%Y-%m-%d')} "
+        f"({len(right_sel_days)} data days used)"
+        if split_view and right_start_date is not None
+        else "Split view disabled"
+    ),
     "map_center": st.session_state.map_center,
     "map_zoom": st.session_state.map_zoom,
     "left_shading": LAYER_OPTIONS[left_shading_layer],
@@ -1739,10 +1826,24 @@ view_info = {
     "right_contour": LAYER_OPTIONS[right_contour_layer] if split_view else "None",
 }
 
+xmin_report, ymin_report, xmax_report, ymax_report = (
+    region_bounds if region_bounds is not None else (None, None, None, None)
+)
+
 stats_info = {
+    "source": (
+        f"MAIN {LAYER_OPTIONS[left_cygnss_layer]}"
+        if left_cygnss_layer is not None
+        else "N/A"
+    ),
+    "date_range": view_info["left_date_range"],
     "thr_min": left_thr_min,
     "thr_max": left_thr_max,
     "region_drawn": region_drawn,
+    "west_lon": f"{xmin_report:.6f}°" if xmin_report is not None else "N/A",
+    "east_lon": f"{xmax_report:.6f}°" if xmax_report is not None else "N/A",
+    "south_lat": f"{ymin_report:.6f}°" if ymin_report is not None else "N/A",
+    "north_lat": f"{ymax_report:.6f}°" if ymax_report is not None else "N/A",
     "min": f"{user_min:.4f}" if user_min is not None else "N/A",
     "max": f"{user_max:.4f}" if user_max is not None else "N/A",
     "mean": f"{user_mean:.4f}" if user_mean is not None else "N/A",
@@ -1752,8 +1853,10 @@ stats_info = {
 
 png_bytes = build_png_report(view_info=view_info, stats_info=stats_info)
 st.download_button(
-    label="Fallback: Download report PNG (metadata + stats)",
+    label="Download analysis report PNG",
     data=png_bytes,
     file_name=f"cygnss_snapshot_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png",
     mime="image/png",
 )
+
+render_fullpage_screenshot_button()
