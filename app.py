@@ -356,11 +356,11 @@ def dates_to_doys(start_date, end_date):
     return selected_dates, sorted(day_keys)
 
 
-def resolve_panel_period(temporal_mode, date_range, window_end, window_days):
+def resolve_panel_period(temporal_mode, date_range, window_start, window_days):
     """Return the calendar period behind a panel and the available asset days."""
     if temporal_mode == "Rolling window":
-        end_date = window_end
-        start_date = max(MIN_DATE, end_date - dt.timedelta(days=window_days - 1))
+        start_date = window_start
+        end_date = min(MAX_DATE, start_date + dt.timedelta(days=window_days - 1))
     else:
         start_date, end_date = parse_date_range(date_range)
         if start_date is None:
@@ -1542,13 +1542,13 @@ with left_col:
         disabled=left_temporal_mode == "Rolling window",
     )
     left_window_days = st.number_input(
-        "MAIN trailing window (calendar days):", 1, 100, 30,
+        "MAIN window length (calendar days):", 1, 100, 30,
         key="left_window_days", disabled=left_temporal_mode != "Rolling window",
     )
-    left_window_end = st.date_input(
-        "MAIN window ending on:", value=MIN_DATE,
+    left_window_start = st.date_input(
+        "MAIN window starting on:", value=MIN_DATE,
         min_value=MIN_DATE, max_value=MAX_DATE,
-        key="left_window_end", disabled=left_temporal_mode != "Rolling window",
+        key="left_window_start", disabled=left_temporal_mode != "Rolling window",
     )
     left_aggregation = st.selectbox(
         "MAIN CYGNSS map statistic:", list(AGGREGATIONS),
@@ -1590,13 +1590,13 @@ with right_col:
         disabled=not split_view or right_temporal_mode == "Rolling window",
     )
     right_window_days = st.number_input(
-        "SECONDARY trailing window (calendar days):", 1, 100, 30,
+        "SECONDARY window length (calendar days):", 1, 100, 30,
         key="right_window_days", disabled=not split_view or right_temporal_mode != "Rolling window",
     )
-    right_window_end = st.date_input(
-        "SECONDARY window ending on:", value=MIN_DATE,
+    right_window_start = st.date_input(
+        "SECONDARY window starting on:", value=MIN_DATE,
         min_value=MIN_DATE, max_value=MAX_DATE,
-        key="right_window_end", disabled=not split_view or right_temporal_mode != "Rolling window",
+        key="right_window_start", disabled=not split_view or right_temporal_mode != "Rolling window",
     )
     right_aggregation = st.selectbox(
         "SECONDARY CYGNSS map statistic:", list(AGGREGATIONS),
@@ -1604,7 +1604,7 @@ with right_col:
     )
 
 left_start_date, left_end_date, left_selected_dates, left_sel_days = resolve_panel_period(
-    left_temporal_mode, left_date_range, left_window_end, left_window_days
+    left_temporal_mode, left_date_range, left_window_start, left_window_days
 )
 if left_start_date is None:
     st.warning("Invalid MAIN date range.")
@@ -1613,6 +1613,8 @@ if left_start_date is None:
 if not left_sel_days:
     st.warning("No valid MAIN dataset days found in selected range.")
     st.stop()
+if left_temporal_mode == "Rolling window" and len(left_selected_dates) < left_window_days:
+    st.info("The MAIN window reaches the end of available data and is shorter than requested.")
 
 left_cygnss_layer = selected_cygnss_layer(left_shading_layer, left_contour_layer)
 left_kind_for_thr = cygnss_layer_kind(left_cygnss_layer) if left_cygnss_layer else "inundation"
@@ -1662,7 +1664,7 @@ left_label = (
 
 if split_view:
     right_start_date, right_end_date, right_selected_dates, right_sel_days = resolve_panel_period(
-        right_temporal_mode, right_date_range, right_window_end, right_window_days
+        right_temporal_mode, right_date_range, right_window_start, right_window_days
     )
     if right_start_date is None:
         st.warning("Invalid SECONDARY date range.")
@@ -1671,6 +1673,8 @@ if split_view:
     if not right_sel_days:
         st.warning("No valid SECONDARY dataset days found in selected range.")
         st.stop()
+    if right_temporal_mode == "Rolling window" and len(right_selected_dates) < right_window_days:
+        st.info("The SECONDARY window reaches the end of available data and is shorter than requested.")
 
     right_cygnss_layer = selected_cygnss_layer(right_shading_layer, right_contour_layer)
     right_kind_for_thr = cygnss_layer_kind(right_cygnss_layer) if right_cygnss_layer else "inundation"
@@ -1990,7 +1994,7 @@ view_info = {
     "left_days_used": len(left_sel_days),
     "left_aggregation": AGGREGATIONS[left_aggregation],
     "left_temporal_mode": (
-        f"{left_window_days}-day trailing window" if left_temporal_mode == "Rolling window" else "custom range"
+        f"{left_window_days}-day window from selected start" if left_temporal_mode == "Rolling window" else "custom range"
     ),
     "right_date_range": (
         f"{right_start_date.strftime('%Y-%m-%d')} to {right_end_date.strftime('%Y-%m-%d')} "
@@ -2001,7 +2005,7 @@ view_info = {
     "map_center": st.session_state.map_center,
     "right_aggregation": AGGREGATIONS[right_aggregation] if split_view else "N/A",
     "right_temporal_mode": (
-        f"{right_window_days}-day trailing window" if right_temporal_mode == "Rolling window" else "custom range"
+        f"{right_window_days}-day window from selected start" if right_temporal_mode == "Rolling window" else "custom range"
     ) if split_view else "N/A",
     "map_zoom": st.session_state.map_zoom,
     "left_shading": LAYER_OPTIONS[left_shading_layer],
