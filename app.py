@@ -20,7 +20,7 @@ from streamlit_folium import st_folium
 # STREAMLIT PAGE SETUP
 # ---------------------------------------------
 st.set_page_config(
-    page_title="CYGNSS – Regional Viewer (5-band inundation & anomalies)",
+    page_title="UCAR/CU CYGNSS v3.1 inundation data viewer",
     layout="wide",
 )
 
@@ -64,13 +64,16 @@ PALETTE_COUNT = [
     "#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6", "#3182bd", "#08519c",
 ]
 AGGREGATIONS = {"mean": "Mean", "min": "Minimum", "max": "Maximum", "count": "Valid-day count"}
+TEMPORAL_AGGREGATIONS = ("mean", "min", "max")
+TEMPORAL_EXTERNAL_LAYERS = ("chirps", "ndvi")
+DAILY_CYGNSS_LAYERS = ("cygnss_1", "cygnss_4")
 
 BAND_OPTIONS = {
-    1: "Daily observations",
-    2: "3-daily interpolated data",
+    1: "1-day inundation observations",
+    2: "3-day interpolated inundation",
     3: "Interpolation flags",
     4: "1-day inundation anomalies",
-    5: "Interpolated inundation anomalies",
+    5: "3-day interpolated inundation anomalies",
 }
 
 CHIRPS_COLLECTION = "UCSB-CHG/CHIRPS/DAILY"
@@ -80,19 +83,19 @@ ELEVATION_IMAGE = "USGS/SRTMGL1_003"
 
 LAYER_OPTIONS = {
     "none": "None",
-    "cygnss_1": "CYGNSS – Daily observations",
-    "cygnss_2": "CYGNSS – 3-daily interpolated data",
-    "cygnss_4": "CYGNSS – 1-day inundation anomalies",
-    "cygnss_5": "CYGNSS – Interpolated inundation anomalies",
-    "chirps": "CHIRPS precipitation",
-    "ndvi": "NDVI",
+    "cygnss_1": f"CYGNSS â€“ {BAND_OPTIONS[1]}",
+    "cygnss_2": f"CYGNSS â€“ {BAND_OPTIONS[2]}",
+    "cygnss_4": f"CYGNSS â€“ {BAND_OPTIONS[4]}",
+    "cygnss_5": f"CYGNSS â€“ {BAND_OPTIONS[5]}",
+    "chirps": "Precipitation (CHIRPS)",
+    "ndvi": "Vegetation (NDVI)",
     "population_density": "Population density",
     "elevation": "Elevation a.s.l.",
 }
 
 OVERLAY_LEGENDS = {
     "chirps": {
-        "title": "Mean CHIRPS precipitation",
+        "title": "CHIRPS precipitation",
         "palette": ["#f7fbff", "#6baed6", "#2171b5", "#08306b"],
         "min": 0,
         "max": 20,
@@ -110,7 +113,7 @@ OVERLAY_LEGENDS = {
         "palette": ["#ffffcc", "#ffeda0", "#feb24c", "#f03b20", "#bd0026"],
         "min": 0,
         "max": 1000,
-        "unit": "people/km²",
+        "unit": "people/kmÂ²",
     },
     "elevation": {
         "title": "Elevation",
@@ -120,6 +123,14 @@ OVERLAY_LEGENDS = {
         "unit": "m a.s.l.",
     },
 }
+AUXILIARY_LAYER_OPTIONS = tuple(OVERLAY_LEGENDS)
+AUXILIARY_SCALE_STEPS = {
+    "chirps": 0.5,
+    "ndvi": 0.01,
+    "population_density": 50.0,
+    "elevation": 100.0,
+}
+
 def band_kind(band_number: int) -> str:
     return "anomaly" if band_number in (4, 5) else "inundation"
 
@@ -271,7 +282,7 @@ def get_collection(kind: str):
 
 
 # ---------------------------------------------
-# HELPER FUNCTIONS – CYGNSS BANDS
+# HELPER FUNCTIONS â€“ CYGNSS BANDS
 # ---------------------------------------------
 def cygnss_valid_raw_band(img, band_index):
     """Return a CYGNSS band masked where the dataset uses 255 as no-data."""
@@ -356,11 +367,11 @@ def dates_to_doys(start_date, end_date):
     return selected_dates, sorted(day_keys)
 
 
-def resolve_panel_period(temporal_mode, date_range, window_start, window_days):
+def resolve_panel_period(temporal_mode, date_range, window_end, window_days):
     """Return the calendar period behind a panel and the available asset days."""
     if temporal_mode == "Rolling window":
-        start_date = window_start
-        end_date = min(MAX_DATE, start_date + dt.timedelta(days=window_days - 1))
+        end_date = window_end
+        start_date = max(MIN_DATE, end_date - dt.timedelta(days=window_days - 1))
     else:
         start_date, end_date = parse_date_range(date_range)
         if start_date is None:
@@ -385,6 +396,8 @@ def build_aggregate_image(selected_days, band_index, aggregation):
     values = ic_sel.map(lambda img: cygnss_scaled_band(img, band_index))
 
     if aggregation == "count":
+        if band_index + 1 not in (1, 4):
+            raise ValueError("Valid-day count is available only for 1-day CYGNSS products.")
         # The daily GeoTIFFs share a grid and footprint. Use one image's
         # footprint to show zero-coverage pixels without merging many geometries.
         footprint = ee.Image(ic_sel.first()).geometry()
@@ -404,6 +417,10 @@ def threshold_aggregate(image, thr_min, thr_max):
 
 def is_cygnss_layer(layer_name: str) -> bool:
     return isinstance(layer_name, str) and layer_name.startswith("cygnss_")
+
+
+def is_temporal_layer(layer_name: str) -> bool:
+    return is_cygnss_layer(layer_name) or layer_name in TEMPORAL_EXTERNAL_LAYERS
 
 
 def cygnss_band_number(layer_name: str) -> int:
@@ -427,7 +444,7 @@ def cygnss_unit(kind: str) -> str:
 def cygnss_legend(layer_name, thr_min, thr_max, aggregation="mean"):
     kind = cygnss_layer_kind(layer_name)
     return {
-        "title": f"CYGNSS – {cygnss_layer_label(layer_name)} ({AGGREGATIONS[aggregation]})",
+        "title": f"CYGNSS â€“ {cygnss_layer_label(layer_name)} ({AGGREGATIONS[aggregation]})",
         "palette": PALETTE_COUNT if aggregation == "count" else (PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND),
         "min": thr_min,
         "max": thr_max,
@@ -435,12 +452,17 @@ def cygnss_legend(layer_name, thr_min, thr_max, aggregation="mean"):
     }
 
 
-def get_layer_legend(layer_name, thr_min=None, thr_max=None, aggregation="mean"):
+def get_layer_legend(layer_name, thr_min=None, thr_max=None, aggregation="mean", value_range=None):
     if layer_name == "none":
         return None
     if is_cygnss_layer(layer_name):
         return cygnss_legend(layer_name, thr_min, thr_max, aggregation)
-    return OVERLAY_LEGENDS[layer_name]
+    legend = OVERLAY_LEGENDS[layer_name]
+    if layer_name in TEMPORAL_EXTERNAL_LAYERS:
+        legend = {**legend, "title": f"{AGGREGATIONS[aggregation]} {legend['title']}"}
+    if value_range is not None:
+        return {**legend, "min": value_range[0], "max": value_range[1]}
+    return legend
 
 
 def build_contours(img, vis, n_levels=10):
@@ -500,7 +522,13 @@ def build_cygnss_image(layer_name, selected_days, thr_min, thr_max, aggregation,
     )
 
 
-def build_external_layer_image(layer_name, start_date, end_date, mode="shading"):
+def reduce_temporal_collection(collection, aggregation):
+    if aggregation not in TEMPORAL_AGGREGATIONS:
+        raise ValueError(f"Unsupported external-layer metric: {aggregation}")
+    return getattr(collection, aggregation)()
+
+
+def build_external_layer_image(layer_name, start_date, end_date, mode="shading", value_range=None, aggregation="mean"):
     """
     Build non-CYGNSS layer image.
     mode="shading" returns a semi-transparent raster.
@@ -513,23 +541,20 @@ def build_external_layer_image(layer_name, start_date, end_date, mode="shading")
         return None
 
     if layer_name == "chirps":
-        img = (
+        collection = (
             ee.ImageCollection(CHIRPS_COLLECTION)
             .filterDate(start_str, end_exclusive)
             .select("precipitation")
-            .mean()
         )
-        vis = OVERLAY_LEGENDS["chirps"]
+        img = reduce_temporal_collection(collection, aggregation)
 
     elif layer_name == "ndvi":
-        img = (
+        collection = (
             ee.ImageCollection(NDVI_COLLECTION)
             .filterDate(start_str, end_exclusive)
             .select("NDVI")
-            .mean()
-            .multiply(0.0001)
         )
-        vis = OVERLAY_LEGENDS["ndvi"]
+        img = reduce_temporal_collection(collection, aggregation).multiply(0.0001)
 
     elif layer_name == "population_density":
         img = (
@@ -538,15 +563,14 @@ def build_external_layer_image(layer_name, start_date, end_date, mode="shading")
             .first()
             .select("population_density")
         )
-        vis = OVERLAY_LEGENDS["population_density"]
 
     elif layer_name == "elevation":
         img = ee.Image(ELEVATION_IMAGE).select("elevation")
-        vis = OVERLAY_LEGENDS["elevation"]
 
     else:
         return None
 
+    vis = get_layer_legend(layer_name, aggregation=aggregation, value_range=value_range)
     if mode == "contour":
         return build_contours(img, vis)
 
@@ -581,7 +605,7 @@ def build_layer_image(
         return None
     if is_cygnss_layer(layer_name):
         return build_cygnss_image(layer_name, selected_days, thr_min, thr_max, aggregation, mode=mode)
-    return build_external_layer_image(layer_name, start_date, end_date, mode=mode)
+    return build_external_layer_image(layer_name, start_date, end_date, mode=mode, aggregation=aggregation)
 
 
 def build_side_visual_image(
@@ -592,11 +616,12 @@ def build_side_visual_image(
     start_date,
     end_date,
     shading_layer,
-    contour_layer,
+    auxiliary_layer,
+    auxiliary_range=None,
+    auxiliary_aggregation="mean",
 ):
     """
-    Build one side of the map. CYGNSS is no longer mandatory:
-    it can be selected as shading, contour, or not selected at all.
+    Build one side of the map with optional non-CYGNSS contour lines.
     """
     base = build_layer_image(
         shading_layer,
@@ -612,30 +637,19 @@ def build_side_visual_image(
     if base is None:
         base = empty_visual_image()
 
-    contour = build_layer_image(
-        contour_layer,
-        selected_days,
-        thr_min,
-        thr_max,
-        aggregation,
-        start_date,
-        end_date,
-        mode="contour",
-    )
-
-    if contour is not None:
+    if auxiliary_layer != "none":
+        contour = build_external_layer_image(
+            auxiliary_layer, start_date, end_date, mode="contour",
+            value_range=auxiliary_range, aggregation=auxiliary_aggregation,
+        )
         base = base.blend(contour)
 
     return base
 
 
-def selected_cygnss_layer(shading_layer, contour_layer):
-    """Return the first CYGNSS layer selected on a side, used for statistics."""
-    if is_cygnss_layer(shading_layer):
-        return shading_layer
-    if is_cygnss_layer(contour_layer):
-        return contour_layer
-    return None
+def selected_cygnss_layer(shading_layer):
+    """Return the CYGNSS shading layer, when selected, for statistics."""
+    return shading_layer if is_cygnss_layer(shading_layer) else None
 # TIME SERIES FOR AREA (CACHE)
 # ---------------------------------------------
 @st.cache_data
@@ -891,10 +905,10 @@ def add_colorbar(
     m.get_root().html.add_child(folium.Element(html))
 
 
-def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, aggregation, position, bottom, role):
+def add_layer_colorbar(m, side_name, layer_name, thr_min, thr_max, aggregation, position, bottom, role, value_range=None):
     if layer_name == "none":
         return
-    cfg = get_layer_legend(layer_name, thr_min, thr_max, aggregation)
+    cfg = get_layer_legend(layer_name, thr_min, thr_max, aggregation, value_range)
     if cfg is None:
         return
     add_colorbar(
@@ -922,16 +936,22 @@ def build_map_from_tiles(
     map_zoom=None,
     right_tile_url=None,
     right_label=None,
+    single_shading_tile_url=None,
+    single_auxiliary_tile_url=None,
     left_shading_layer="none",
-    left_contour_layer="none",
+    left_auxiliary_layer="none",
+    left_auxiliary_range=None,
     right_shading_layer="none",
-    right_contour_layer="none",
+    right_auxiliary_layer="none",
+    right_auxiliary_range=None,
     left_thr_min=None,
     left_thr_max=None,
     right_thr_min=None,
     right_thr_max=None,
     left_aggregation="mean",
     right_aggregation="mean",
+    left_auxiliary_aggregation="mean",
+    right_auxiliary_aggregation="mean",
 ):
     """Build a fresh Folium object from already-resolved tile URLs.
 
@@ -947,16 +967,37 @@ def build_map_from_tiles(
 
         m = folium.Map(location=map_center, zoom_start=map_zoom, tiles="Esri.WorldImagery")
 
-        left_layer = folium.TileLayer(
-            tiles=left_tile_url,
-            attr="Google Earth Engine",
-            name=left_label,
-            overlay=True,
-            control=True,
-        )
-        left_layer.add_to(m)
+        if right_tile_url is None:
+            # Separate overlays let the single-map LayerControl toggle shading
+            # and contours independently without requesting new EE tiles.
+            if single_shading_tile_url is not None:
+                folium.TileLayer(
+                    tiles=single_shading_tile_url,
+                    attr="Google Earth Engine",
+                    name=f"Shading: {LAYER_OPTIONS[left_shading_layer]}",
+                    overlay=True,
+                    control=True,
+                    show=True,
+                ).add_to(m)
+            if single_auxiliary_tile_url is not None:
+                folium.TileLayer(
+                    tiles=single_auxiliary_tile_url,
+                    attr="Google Earth Engine",
+                    name=f"Auxiliary contours: {LAYER_OPTIONS[left_auxiliary_layer]}",
+                    overlay=True,
+                    control=True,
+                    show=True,
+                ).add_to(m)
+        else:
+            left_layer = folium.TileLayer(
+                tiles=left_tile_url,
+                attr="Google Earth Engine",
+                name=left_label,
+                overlay=True,
+                control=True,
+            )
+            left_layer.add_to(m)
 
-        if right_tile_url is not None:
             if right_label is None:
                 right_label = "SECONDARY layer"
 
@@ -994,8 +1035,9 @@ def build_map_from_tiles(
             left_aggregation, position="left", bottom="40px", role="shading"
         )
         add_layer_colorbar(
-            m, "MAIN", left_contour_layer, left_thr_min, left_thr_max,
-            left_aggregation, position="left", bottom="260px", role="contour"
+            m, "MAIN", left_auxiliary_layer, left_thr_min, left_thr_max,
+            left_auxiliary_aggregation, position="left", bottom="260px", role="auxiliary",
+            value_range=left_auxiliary_range,
         )
 
         if right_tile_url is not None:
@@ -1004,11 +1046,12 @@ def build_map_from_tiles(
                 right_aggregation, position="right", bottom="40px", role="shading"
             )
             add_layer_colorbar(
-                m, "SECONDARY", right_contour_layer, right_thr_min, right_thr_max,
-                right_aggregation, position="right", bottom="260px", role="contour"
+                m, "SECONDARY", right_auxiliary_layer, right_thr_min, right_thr_max,
+                right_auxiliary_aggregation, position="right", bottom="260px", role="auxiliary",
+                value_range=right_auxiliary_range,
             )
 
-        folium.LayerControl().add_to(m)
+        folium.LayerControl(collapsed=right_tile_url is not None).add_to(m)
         return m
 
     except Exception as e:
@@ -1037,7 +1080,77 @@ def saved_region_feature_group(feature):
         },
     ).add_to(fg)
     return fg
-# ALTAIR PLOT – MIN / MAX / MEAN
+
+
+def remember_map_view(map_state):
+    """Keep the current Leaflet view across changes to the displayed layers."""
+    if not isinstance(map_state, dict):
+        return
+
+    center = map_state.get("center")
+    if isinstance(center, dict) and isinstance(center.get("lat"), (int, float)) and isinstance(center.get("lng"), (int, float)):
+        st.session_state.map_center = [center["lat"], center["lng"]]
+
+    zoom = map_state.get("zoom")
+    if isinstance(zoom, (int, float)):
+        st.session_state.map_zoom = zoom
+
+
+def auxiliary_scale_controls(side, layer_name):
+    """Choose independent contour levels for an enabled auxiliary layer."""
+    if layer_name == "none":
+        return None
+
+    legend = OVERLAY_LEGENDS[layer_name]
+    step = AUXILIARY_SCALE_STEPS[layer_name]
+    number_format = "%.2f" if layer_name == "ndvi" else "%.1f"
+    unit = legend["unit"]
+    st.markdown(f"**Contour scale**{f' ({unit})' if unit != '-' else ''}")
+    min_col, max_col = st.columns(2)
+    with min_col:
+        minimum = st.number_input(
+            "Minimum", value=float(legend["min"]), step=step,
+            format=number_format, key=f"{side}_auxiliary_min_{layer_name}",
+        )
+    with max_col:
+        maximum = st.number_input(
+            "Maximum", value=float(legend["max"]), step=step,
+            format=number_format, key=f"{side}_auxiliary_max_{layer_name}",
+        )
+    if minimum >= maximum:
+        st.error("Contour scale minimum must be smaller than maximum.")
+        st.stop()
+    return (minimum, maximum)
+
+
+def displayed_metric_control(side, shading_layer, disabled=False):
+    if not is_temporal_layer(shading_layer):
+        st.caption("Displayed metric: not applicable to a static layer.")
+        return "mean"
+
+    options = list(TEMPORAL_AGGREGATIONS)
+    if shading_layer in DAILY_CYGNSS_LAYERS:
+        options.append("count")
+    key = f"{side}_aggregation"
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = "mean"
+    return st.selectbox(
+        "Displayed metric:", options, format_func=AGGREGATIONS.get,
+        key=key, disabled=disabled,
+    )
+
+
+def auxiliary_metric_control(side, auxiliary_layer, disabled=False):
+    if auxiliary_layer not in TEMPORAL_EXTERNAL_LAYERS:
+        return "mean"
+    return st.selectbox(
+        "Auxiliary displayed metric:", TEMPORAL_AGGREGATIONS,
+        format_func=AGGREGATIONS.get,
+        key=f"{side}_auxiliary_aggregation", disabled=disabled,
+    )
+
+
+# ALTAIR PLOT â€“ MIN / MAX / MEAN
 # ---------------------------------------------
 def plot_timeseries(df, title, kind, thr_max):
     if df.empty:
@@ -1090,7 +1203,7 @@ def plot_timeseries(df, title, kind, thr_max):
 
 
 # ---------------------------------------------
-# ALTAIR PLOT – PIXEL COUNTS PER DAY
+# ALTAIR PLOT â€“ PIXEL COUNTS PER DAY
 # ---------------------------------------------
 def plot_pixelcount_timeseries(df, title):
     required_cols = {"count_total", "count_inrange"}
@@ -1184,20 +1297,24 @@ def build_png_report(view_info, stats_info):
     left_margin = 60
     line_h = 42
 
-    draw.text((left_margin, y), "CYGNSS Viewer — Snapshot report", fill="black", font=font_title)
+    draw.text((left_margin, y), "CYGNSS Viewer â€” Snapshot report", fill="black", font=font_title)
     y += line_h * 2
 
     header_lines = [
         f"Generated (UTC): {view_info['generated_utc']}",
         f"MAIN date range: {view_info['left_date_range']} ({view_info['left_days_used']} data days used)",
-        f"MAIN CYGNSS statistic: {view_info['left_aggregation']} | time selection: {view_info['left_temporal_mode']}",
+        f"MAIN displayed metric: {view_info['left_aggregation']} | time selection: {view_info['left_temporal_mode']}",
         f"SECONDARY date range: {view_info['right_date_range']}",
-        f"SECONDARY CYGNSS statistic: {view_info['right_aggregation']} | time selection: {view_info['right_temporal_mode']}",
+        f"SECONDARY displayed metric: {view_info['right_aggregation']} | time selection: {view_info['right_temporal_mode']}",
         f"Map center: {view_info['map_center'][0]:.4f}, {view_info['map_center'][1]:.4f} | zoom: {view_info['map_zoom']}",
         f"MAIN shading: {view_info['left_shading']}",
-        f"MAIN contour: {view_info['left_contour']}",
+        f"MAIN auxiliary: {view_info['left_auxiliary']}",
+        f"MAIN auxiliary metric: {view_info['left_auxiliary_aggregation']}",
+        f"MAIN contour scale: {view_info['left_auxiliary_scale']}",
         f"SECONDARY shading: {view_info['right_shading']}",
-        f"SECONDARY contour: {view_info['right_contour']}",
+        f"SECONDARY auxiliary: {view_info['right_auxiliary']}",
+        f"SECONDARY auxiliary metric: {view_info['right_auxiliary_aggregation']}",
+        f"SECONDARY contour scale: {view_info['right_auxiliary_scale']}",
     ]
     for line in header_lines:
         draw.text((left_margin, y), line, fill="black", font=font_body)
@@ -1210,7 +1327,7 @@ def build_png_report(view_info, stats_info):
     rows = [
         ("Statistics source", stats_info["source"]),
         ("Analysis date range", stats_info["date_range"]),
-        ("Threshold range", f"{stats_info['thr_min']} → {stats_info['thr_max']} {stats_info['unit']}"),
+        ("Threshold range", f"{stats_info['thr_min']} â†’ {stats_info['thr_max']} {stats_info['unit']}"),
         ("Region drawn", stats_info["region_drawn"]),
         ("Rectangle west longitude", stats_info["west_lon"]),
         ("Rectangle east longitude", stats_info["east_lon"]),
@@ -1456,11 +1573,19 @@ def render_fullpage_screenshot_button():
 # ---------------------------------------------
 # APP HEADER
 # ---------------------------------------------
-st.title("CYGNSS – Regional Viewer")
+st.markdown(
+    "<h1 style='text-align: center;'>CYGNSS-DASH</h1>",
+    unsafe_allow_html=True,
+)
+st.markdown(
+    "<h2 style='text-align: center;'>UCAR/CU CYGNSS v3.1 inundation data viewer</h2>",
+    unsafe_allow_html=True,
+)
 st.caption(
     "Compare MAIN/SECONDARY map layers over independent date ranges. "
-    "Each side can use one shading layer and one contour layer. "
-    "CYGNSS layers can show pixel-wise mean, minimum, maximum or valid-day count."
+    "Each side can use one shading layer and an optional auxiliary contour layer. "
+    "Time-varying layers can show pixel-wise mean, minimum or maximum; "
+    "1-day CYGNSS products can also show valid-day count."
 )
 
 # ---------------------------------------------
@@ -1482,6 +1607,10 @@ if "left_tile_url" not in st.session_state:
     st.session_state.left_tile_url = None
 if "right_tile_url" not in st.session_state:
     st.session_state.right_tile_url = None
+if "single_shading_tile_url" not in st.session_state:
+    st.session_state.single_shading_tile_url = None
+if "single_auxiliary_tile_url" not in st.session_state:
+    st.session_state.single_auxiliary_tile_url = None
 if "map_revision" not in st.session_state:
     st.session_state.map_revision = 0
 
@@ -1491,6 +1620,7 @@ if "map_revision" not in st.session_state:
 # the drawing-triggered rerun.
 component_key = f"cygnss_map_{st.session_state.map_revision}"
 _previous_map_state = st.session_state.get(component_key)
+remember_map_view(_previous_map_state)
 _previous_feature = extract_feature_from_map_state(_previous_map_state)
 if _previous_feature and "geometry" in _previous_feature:
     st.session_state.saved_feature = _previous_feature
@@ -1513,27 +1643,33 @@ with left_col:
     st.markdown("### MAIN panel")
 
     left_shading_layer = st.selectbox(
-        "MAIN shading layer:",
+        "Shading layer:",
         list(LAYER_OPTIONS.keys()),
         index=list(LAYER_OPTIONS.keys()).index("cygnss_1"),
         format_func=lambda k: LAYER_OPTIONS[k],
         key="left_shading_layer",
     )
 
-    left_contour_layer = st.selectbox(
-        "MAIN contour layer:",
-        list(LAYER_OPTIONS.keys()),
-        index=0,
-        format_func=lambda k: LAYER_OPTIONS[k],
-        key="left_contour_layer",
+    left_auxiliary_enabled = st.checkbox(
+        "Enable Auxiliary layer", key="left_auxiliary_enabled"
     )
+    left_auxiliary_selection = st.selectbox(
+        "Auxiliary layer:",
+        AUXILIARY_LAYER_OPTIONS,
+        format_func=lambda k: LAYER_OPTIONS[k],
+        key="left_auxiliary_selection",
+        disabled=not left_auxiliary_enabled,
+    )
+    left_auxiliary_layer = left_auxiliary_selection if left_auxiliary_enabled else "none"
+    left_auxiliary_range = auxiliary_scale_controls("left", left_auxiliary_layer)
+    left_auxiliary_aggregation = auxiliary_metric_control("left", left_auxiliary_layer)
 
     left_temporal_mode = st.selectbox(
-        "MAIN temporal mode:", ["Custom date range", "Rolling window"],
+        "Temporal mode:", ["Date range", "Rolling window"],
         key="left_temporal_mode",
     )
     left_date_range = st.date_input(
-        "MAIN custom date range (from–to):",
+        "Date range (fromâ€“to):",
         value=(MIN_DATE, MIN_DATE),
         min_value=MIN_DATE,
         max_value=MAX_DATE,
@@ -1542,24 +1678,21 @@ with left_col:
         disabled=left_temporal_mode == "Rolling window",
     )
     left_window_days = st.number_input(
-        "MAIN window length (calendar days):", 1, 100, 30,
+        "Window length (calendar days):", 1, 100, 30,
         key="left_window_days", disabled=left_temporal_mode != "Rolling window",
     )
-    left_window_start = st.date_input(
-        "MAIN window starting on:", value=MIN_DATE,
+    left_window_end = st.date_input(
+        "Window ending on:", value=MAX_DATE,
         min_value=MIN_DATE, max_value=MAX_DATE,
-        key="left_window_start", disabled=left_temporal_mode != "Rolling window",
+        key="left_window_end", disabled=left_temporal_mode != "Rolling window",
     )
-    left_aggregation = st.selectbox(
-        "MAIN CYGNSS map statistic:", list(AGGREGATIONS),
-        format_func=AGGREGATIONS.get, key="left_aggregation",
-    )
+    left_aggregation = displayed_metric_control("left", left_shading_layer)
 
 with right_col:
     st.markdown("### SECONDARY panel")
 
     right_shading_layer = st.selectbox(
-        "SECONDARY shading layer:",
+        "Shading layer:",
         list(LAYER_OPTIONS.keys()),
         index=list(LAYER_OPTIONS.keys()).index("cygnss_1"),
         format_func=lambda k: LAYER_OPTIONS[k],
@@ -1567,21 +1700,32 @@ with right_col:
         disabled=not split_view,
     )
 
-    right_contour_layer = st.selectbox(
-        "SECONDARY contour layer:",
-        list(LAYER_OPTIONS.keys()),
-        index=0,
-        format_func=lambda k: LAYER_OPTIONS[k],
-        key="right_contour_layer",
+    right_auxiliary_enabled = st.checkbox(
+        "Enable Auxiliary layer",
+        key="right_auxiliary_enabled",
         disabled=not split_view,
+    )
+    right_auxiliary_selection = st.selectbox(
+        "Auxiliary layer:",
+        AUXILIARY_LAYER_OPTIONS,
+        format_func=lambda k: LAYER_OPTIONS[k],
+        key="right_auxiliary_selection",
+        disabled=not split_view or not right_auxiliary_enabled,
+    )
+    right_auxiliary_layer = (
+        right_auxiliary_selection if split_view and right_auxiliary_enabled else "none"
+    )
+    right_auxiliary_range = auxiliary_scale_controls("right", right_auxiliary_layer)
+    right_auxiliary_aggregation = auxiliary_metric_control(
+        "right", right_auxiliary_layer, disabled=not split_view
     )
 
     right_temporal_mode = st.selectbox(
-        "SECONDARY temporal mode:", ["Custom date range", "Rolling window"],
+        "Temporal mode:", ["Date range", "Rolling window"],
         key="right_temporal_mode", disabled=not split_view,
     )
     right_date_range = st.date_input(
-        "SECONDARY custom date range (from–to):",
+        "Date range (fromâ€“to):",
         value=(MIN_DATE, MIN_DATE),
         min_value=MIN_DATE,
         max_value=MAX_DATE,
@@ -1590,42 +1734,41 @@ with right_col:
         disabled=not split_view or right_temporal_mode == "Rolling window",
     )
     right_window_days = st.number_input(
-        "SECONDARY window length (calendar days):", 1, 100, 30,
+        "Window length (calendar days):", 1, 100, 30,
         key="right_window_days", disabled=not split_view or right_temporal_mode != "Rolling window",
     )
-    right_window_start = st.date_input(
-        "SECONDARY window starting on:", value=MIN_DATE,
+    right_window_end = st.date_input(
+        "Window ending on:", value=MAX_DATE,
         min_value=MIN_DATE, max_value=MAX_DATE,
-        key="right_window_start", disabled=not split_view or right_temporal_mode != "Rolling window",
+        key="right_window_end", disabled=not split_view or right_temporal_mode != "Rolling window",
     )
-    right_aggregation = st.selectbox(
-        "SECONDARY CYGNSS map statistic:", list(AGGREGATIONS),
-        format_func=AGGREGATIONS.get, key="right_aggregation", disabled=not split_view,
+    right_aggregation = displayed_metric_control(
+        "right", right_shading_layer, disabled=not split_view
     )
 
 left_start_date, left_end_date, left_selected_dates, left_sel_days = resolve_panel_period(
-    left_temporal_mode, left_date_range, left_window_start, left_window_days
+    left_temporal_mode, left_date_range, left_window_end, left_window_days
 )
 if left_start_date is None:
     st.warning("Invalid MAIN date range.")
     st.stop()
 
-if not left_sel_days:
-    st.warning("No valid MAIN dataset days found in selected range.")
+if not left_sel_days and is_cygnss_layer(left_shading_layer):
+    st.warning("No valid MAIN CYGNSS days found in selected range.")
     st.stop()
 if left_temporal_mode == "Rolling window" and len(left_selected_dates) < left_window_days:
-    st.info("The MAIN window reaches the end of available data and is shorter than requested.")
+    st.info("The MAIN window reaches the start of available data and is shorter than requested.")
 
-left_cygnss_layer = selected_cygnss_layer(left_shading_layer, left_contour_layer)
-left_kind_for_thr = cygnss_layer_kind(left_cygnss_layer) if left_cygnss_layer else "inundation"
-
-if left_aggregation == "count":
+left_cygnss_layer = selected_cygnss_layer(left_shading_layer)
+if left_cygnss_layer is None:
+    left_thr_min = left_thr_max = None
+elif left_aggregation == "count":
     left_thr_min, left_thr_max = st.slider(
         "MAIN CYGNSS valid-day count range:",
         min_value=0, max_value=len(left_sel_days), value=(0, len(left_sel_days)),
         step=1, key="left_count_thr",
     )
-elif left_kind_for_thr == "anomaly":
+elif cygnss_layer_kind(left_cygnss_layer) == "anomaly":
     left_thr_min, left_thr_max = st.slider(
         "MAIN CYGNSS threshold range:",
         min_value=-100,
@@ -1644,48 +1787,41 @@ else:
         key="left_thr",
     )
 
-if left_thr_min >= left_thr_max:
+if left_cygnss_layer is not None and left_thr_min >= left_thr_max:
     st.error("MAIN lower threshold must be smaller than upper threshold.")
     st.stop()
 
-if left_aggregation != "count" and is_cygnss_layer(left_shading_layer) and is_cygnss_layer(left_contour_layer):
-    if cygnss_layer_kind(left_shading_layer) != cygnss_layer_kind(left_contour_layer):
-        st.warning(
-            "MAIN uses one CYGNSS threshold slider for both CYGNSS layers. "
-            "You selected one normal band and one anomaly band, so the same threshold range may not fit both."
-        )
-
 left_label = (
     f"MAIN | shading: {LAYER_OPTIONS[left_shading_layer]} | "
-    f"contour: {LAYER_OPTIONS[left_contour_layer]} | "
-    f"{left_start_date.strftime('%Y-%m-%d')}→{left_end_date.strftime('%Y-%m-%d')} | "
-    f"{AGGREGATIONS[left_aggregation]}"
+    f"auxiliary: {LAYER_OPTIONS[left_auxiliary_layer]} | "
+    f"{left_start_date.strftime('%Y-%m-%d')}â†’{left_end_date.strftime('%Y-%m-%d')} | "
+    f"{AGGREGATIONS[left_aggregation] if is_temporal_layer(left_shading_layer) else 'N/A'}"
 )
 
 if split_view:
     right_start_date, right_end_date, right_selected_dates, right_sel_days = resolve_panel_period(
-        right_temporal_mode, right_date_range, right_window_start, right_window_days
+        right_temporal_mode, right_date_range, right_window_end, right_window_days
     )
     if right_start_date is None:
         st.warning("Invalid SECONDARY date range.")
         st.stop()
 
-    if not right_sel_days:
-        st.warning("No valid SECONDARY dataset days found in selected range.")
+    if not right_sel_days and is_cygnss_layer(right_shading_layer):
+        st.warning("No valid SECONDARY CYGNSS days found in selected range.")
         st.stop()
     if right_temporal_mode == "Rolling window" and len(right_selected_dates) < right_window_days:
-        st.info("The SECONDARY window reaches the end of available data and is shorter than requested.")
+        st.info("The SECONDARY window reaches the start of available data and is shorter than requested.")
 
-    right_cygnss_layer = selected_cygnss_layer(right_shading_layer, right_contour_layer)
-    right_kind_for_thr = cygnss_layer_kind(right_cygnss_layer) if right_cygnss_layer else "inundation"
-
-    if right_aggregation == "count":
+    right_cygnss_layer = selected_cygnss_layer(right_shading_layer)
+    if right_cygnss_layer is None:
+        right_thr_min = right_thr_max = None
+    elif right_aggregation == "count":
         right_thr_min, right_thr_max = st.slider(
             "SECONDARY CYGNSS valid-day count range:",
             min_value=0, max_value=len(right_sel_days), value=(0, len(right_sel_days)),
             step=1, key="right_count_thr",
         )
-    elif right_kind_for_thr == "anomaly":
+    elif cygnss_layer_kind(right_cygnss_layer) == "anomaly":
         right_thr_min, right_thr_max = st.slider(
             "SECONDARY CYGNSS threshold range:",
             min_value=-100,
@@ -1704,22 +1840,15 @@ if split_view:
             key="right_thr",
         )
 
-    if right_thr_min >= right_thr_max:
+    if right_cygnss_layer is not None and right_thr_min >= right_thr_max:
         st.error("SECONDARY lower threshold must be smaller than upper threshold.")
         st.stop()
 
-    if right_aggregation != "count" and is_cygnss_layer(right_shading_layer) and is_cygnss_layer(right_contour_layer):
-        if cygnss_layer_kind(right_shading_layer) != cygnss_layer_kind(right_contour_layer):
-            st.warning(
-                "SECONDARY uses one CYGNSS threshold slider for both CYGNSS layers. "
-                "You selected one normal band and one anomaly band, so the same threshold range may not fit both."
-            )
-
     right_label = (
         f"SECONDARY | shading: {LAYER_OPTIONS[right_shading_layer]} | "
-        f"contour: {LAYER_OPTIONS[right_contour_layer]} | "
-        f"{right_start_date.strftime('%Y-%m-%d')}→{right_end_date.strftime('%Y-%m-%d')} | "
-        f"{AGGREGATIONS[right_aggregation]}"
+        f"auxiliary: {LAYER_OPTIONS[right_auxiliary_layer]} | "
+        f"{right_start_date.strftime('%Y-%m-%d')}â†’{right_end_date.strftime('%Y-%m-%d')} | "
+        f"{AGGREGATIONS[right_aggregation] if is_temporal_layer(right_shading_layer) else 'N/A'}"
     )
 else:
     right_sel_days = None
@@ -1731,15 +1860,13 @@ else:
     right_cygnss_layer = None
 
 st.caption(
-    f"MAIN: {len(left_sel_days)} asset day(s) available in "
-    f"{len(left_selected_dates)} calendar day(s); {AGGREGATIONS[left_aggregation].lower()} "
-    "is computed per pixel before applying the display threshold."
+    f"MAIN: {len(left_sel_days)} CYGNSS asset day(s) in "
+    f"{len(left_selected_dates)} selected calendar day(s)."
 )
 if split_view and right_start_date is not None:
     st.caption(
-        f"SECONDARY: {len(right_sel_days)} asset day(s) available in "
-        f"{len(right_selected_dates)} calendar day(s); {AGGREGATIONS[right_aggregation].lower()} "
-        "is computed per pixel before applying the display threshold."
+        f"SECONDARY: {len(right_sel_days)} CYGNSS asset day(s) in "
+        f"{len(right_selected_dates)} selected calendar day(s)."
     )
 # ---------------------------------------------
 # BUILD / DISPLAY MAP
@@ -1748,15 +1875,20 @@ if split_view and right_start_date is not None:
 # Drawing a rectangle does NOT change this signature, so no new EE map request
 # is made on the drawing-triggered rerun.
 map_signature = (
+    "external-temporal-metrics-v1",
     bool(split_view),
     left_shading_layer,
-    left_contour_layer,
+    left_auxiliary_layer,
+    left_auxiliary_range,
+    left_auxiliary_aggregation,
     tuple(left_sel_days),
     left_aggregation,
-    float(left_thr_min),
-    float(left_thr_max),
+    float(left_thr_min) if left_thr_min is not None else None,
+    float(left_thr_max) if left_thr_max is not None else None,
     right_shading_layer if split_view else "none",
-    right_contour_layer if split_view else "none",
+    right_auxiliary_layer if split_view else "none",
+    right_auxiliary_range if split_view else None,
+    right_auxiliary_aggregation if split_view else None,
     tuple(right_sel_days) if split_view and right_sel_days is not None else (),
     right_aggregation if split_view else None,
     float(right_thr_min) if right_thr_min is not None else None,
@@ -1764,27 +1896,32 @@ map_signature = (
 )
 
 if (
-    st.session_state.left_tile_url is None
-    or st.session_state.map_tile_signature != map_signature
+    st.session_state.map_tile_signature != map_signature
+    or (split_view and st.session_state.left_tile_url is None)
 ):
-    try:
-        left_visual_image = build_side_visual_image(
-            selected_days=left_sel_days,
-            aggregation=left_aggregation,
-            thr_min=left_thr_min,
-            thr_max=left_thr_max,
-            start_date=left_start_date,
-            end_date=left_end_date,
-            shading_layer=left_shading_layer,
-            contour_layer=left_contour_layer,
-        )
-        st.session_state.left_tile_url = ee_tile_url(left_visual_image)
-    except Exception as e:
-        st.error(f"Failed to build MAIN image: {e}")
-        st.stop()
-
+    st.session_state.left_tile_url = None
     st.session_state.right_tile_url = None
-    if split_view and right_sel_days is not None:
+    st.session_state.single_shading_tile_url = None
+    st.session_state.single_auxiliary_tile_url = None
+    if split_view:
+        try:
+            left_visual_image = build_side_visual_image(
+                selected_days=left_sel_days,
+                aggregation=left_aggregation,
+                thr_min=left_thr_min,
+                thr_max=left_thr_max,
+                start_date=left_start_date,
+                end_date=left_end_date,
+                shading_layer=left_shading_layer,
+                auxiliary_layer=left_auxiliary_layer,
+                auxiliary_range=left_auxiliary_range,
+                auxiliary_aggregation=left_auxiliary_aggregation,
+            )
+            st.session_state.left_tile_url = ee_tile_url(left_visual_image)
+        except Exception as e:
+            st.error(f"Failed to build MAIN image: {e}")
+            st.stop()
+
         try:
             right_visual_image = build_side_visual_image(
                 selected_days=right_sel_days,
@@ -1794,11 +1931,32 @@ if (
                 start_date=right_start_date,
                 end_date=right_end_date,
                 shading_layer=right_shading_layer,
-                contour_layer=right_contour_layer,
+                auxiliary_layer=right_auxiliary_layer,
+                auxiliary_range=right_auxiliary_range,
+                auxiliary_aggregation=right_auxiliary_aggregation,
             )
             st.session_state.right_tile_url = ee_tile_url(right_visual_image)
         except Exception as e:
             st.error(f"Failed to build SECONDARY image: {e}")
+            st.stop()
+    else:
+        try:
+            shading_image = build_layer_image(
+                left_shading_layer, left_sel_days, left_thr_min, left_thr_max,
+                left_aggregation, left_start_date, left_end_date, mode="shading",
+            )
+            if shading_image is not None:
+                st.session_state.single_shading_tile_url = ee_tile_url(shading_image)
+
+            if left_auxiliary_layer != "none":
+                contour_image = build_external_layer_image(
+                    left_auxiliary_layer, left_start_date, left_end_date,
+                    mode="contour", value_range=left_auxiliary_range,
+                    aggregation=left_auxiliary_aggregation,
+                )
+                st.session_state.single_auxiliary_tile_url = ee_tile_url(contour_image)
+        except Exception as e:
+            st.error(f"Failed to build MAIN layers: {e}")
             st.stop()
 
     st.session_state.map_tile_signature = map_signature
@@ -1809,20 +1967,28 @@ if (
 m = build_map_from_tiles(
     left_tile_url=st.session_state.left_tile_url,
     left_label=left_label,
-    map_center=st.session_state.map_center,
-    map_zoom=st.session_state.map_zoom,
+    # Keep the Folium script stable during panning and zooming. The live view
+    # is passed separately to st_folium and restored after layer changes.
+    map_center=CENTER,
+    map_zoom=ZOOM,
     right_tile_url=st.session_state.right_tile_url if split_view else None,
     right_label=right_label,
+    single_shading_tile_url=st.session_state.single_shading_tile_url if not split_view else None,
+    single_auxiliary_tile_url=st.session_state.single_auxiliary_tile_url if not split_view else None,
     left_shading_layer=left_shading_layer,
-    left_contour_layer=left_contour_layer,
+    left_auxiliary_layer=left_auxiliary_layer,
+    left_auxiliary_range=left_auxiliary_range,
     right_shading_layer=right_shading_layer if split_view else "none",
-    right_contour_layer=right_contour_layer if split_view else "none",
+    right_auxiliary_layer=right_auxiliary_layer if split_view else "none",
+    right_auxiliary_range=right_auxiliary_range if split_view else None,
     left_thr_min=left_thr_min,
     left_thr_max=left_thr_max,
     right_thr_min=right_thr_min,
     right_thr_max=right_thr_max,
     left_aggregation=left_aggregation,
     right_aggregation=right_aggregation,
+    left_auxiliary_aggregation=left_auxiliary_aggregation,
+    right_auxiliary_aggregation=right_auxiliary_aggregation,
 )
 
 # The saved region is sent separately from the base map. streamlit-folium
@@ -1834,9 +2000,12 @@ map_state = st_folium(
     height=650,
     width=None,
     key=component_key,
-    returned_objects=["last_active_drawing", "all_drawings"],
+    center=st.session_state.map_center,
+    zoom=st.session_state.map_zoom,
+    returned_objects=["last_active_drawing", "all_drawings", "center", "zoom"],
     feature_group_to_add=region_fg,
 )
+remember_map_view(map_state)
 
 current_feature = extract_feature_from_map_state(map_state)
 if current_feature and "geometry" in current_feature:
@@ -1992,9 +2161,9 @@ view_info = {
         f"{left_start_date.strftime('%Y-%m-%d')} to {left_end_date.strftime('%Y-%m-%d')}"
     ),
     "left_days_used": len(left_sel_days),
-    "left_aggregation": AGGREGATIONS[left_aggregation],
+    "left_aggregation": AGGREGATIONS[left_aggregation] if is_temporal_layer(left_shading_layer) else "N/A",
     "left_temporal_mode": (
-        f"{left_window_days}-day window from selected start" if left_temporal_mode == "Rolling window" else "custom range"
+        f"{left_window_days}-day window ending on selected date" if left_temporal_mode == "Rolling window" else "date range"
     ),
     "right_date_range": (
         f"{right_start_date.strftime('%Y-%m-%d')} to {right_end_date.strftime('%Y-%m-%d')} "
@@ -2003,15 +2172,36 @@ view_info = {
         else "Split view disabled"
     ),
     "map_center": st.session_state.map_center,
-    "right_aggregation": AGGREGATIONS[right_aggregation] if split_view else "N/A",
+    "right_aggregation": (
+        AGGREGATIONS[right_aggregation]
+        if split_view and is_temporal_layer(right_shading_layer) else "N/A"
+    ),
     "right_temporal_mode": (
-        f"{right_window_days}-day window from selected start" if right_temporal_mode == "Rolling window" else "custom range"
+        f"{right_window_days}-day window ending on selected date" if right_temporal_mode == "Rolling window" else "date range"
     ) if split_view else "N/A",
     "map_zoom": st.session_state.map_zoom,
     "left_shading": LAYER_OPTIONS[left_shading_layer],
-    "left_contour": LAYER_OPTIONS[left_contour_layer],
+    "left_auxiliary": LAYER_OPTIONS[left_auxiliary_layer],
+    "left_auxiliary_aggregation": (
+        AGGREGATIONS[left_auxiliary_aggregation]
+        if left_auxiliary_layer in TEMPORAL_EXTERNAL_LAYERS else "N/A"
+    ),
+    "left_auxiliary_scale": (
+        f"{left_auxiliary_range[0]:g} to {left_auxiliary_range[1]:g} "
+        f"{OVERLAY_LEGENDS[left_auxiliary_layer]['unit']}"
+        if left_auxiliary_range is not None else "N/A"
+    ),
     "right_shading": LAYER_OPTIONS[right_shading_layer] if split_view else "None",
-    "right_contour": LAYER_OPTIONS[right_contour_layer] if split_view else "None",
+    "right_auxiliary": LAYER_OPTIONS[right_auxiliary_layer] if split_view else "None",
+    "right_auxiliary_aggregation": (
+        AGGREGATIONS[right_auxiliary_aggregation]
+        if split_view and right_auxiliary_layer in TEMPORAL_EXTERNAL_LAYERS else "N/A"
+    ),
+    "right_auxiliary_scale": (
+        f"{right_auxiliary_range[0]:g} to {right_auxiliary_range[1]:g} "
+        f"{OVERLAY_LEGENDS[right_auxiliary_layer]['unit']}"
+        if right_auxiliary_range is not None else "N/A"
+    ),
 }
 
 xmin_report, ymin_report, xmax_report, ymax_report = (
@@ -2025,14 +2215,14 @@ stats_info = {
         else "N/A"
     ),
     "date_range": view_info["left_date_range"],
-    "thr_min": left_thr_min,
-    "thr_max": left_thr_max,
-    "unit": "days" if left_aggregation == "count" else "%",
+    "thr_min": left_thr_min if left_thr_min is not None else "N/A",
+    "thr_max": left_thr_max if left_thr_max is not None else "N/A",
+    "unit": "N/A" if left_cygnss_layer is None else ("days" if left_aggregation == "count" else "%"),
     "region_drawn": region_drawn,
-    "west_lon": f"{xmin_report:.6f}°" if xmin_report is not None else "N/A",
-    "east_lon": f"{xmax_report:.6f}°" if xmax_report is not None else "N/A",
-    "south_lat": f"{ymin_report:.6f}°" if ymin_report is not None else "N/A",
-    "north_lat": f"{ymax_report:.6f}°" if ymax_report is not None else "N/A",
+    "west_lon": f"{xmin_report:.6f}Â°" if xmin_report is not None else "N/A",
+    "east_lon": f"{xmax_report:.6f}Â°" if xmax_report is not None else "N/A",
+    "south_lat": f"{ymin_report:.6f}Â°" if ymin_report is not None else "N/A",
+    "north_lat": f"{ymax_report:.6f}Â°" if ymax_report is not None else "N/A",
     "min": f"{user_min:.4f}" if user_min is not None else "N/A",
     "max": f"{user_max:.4f}" if user_max is not None else "N/A",
     "mean": f"{user_mean:.4f}" if user_mean is not None else "N/A",
