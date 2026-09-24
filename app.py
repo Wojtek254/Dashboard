@@ -522,9 +522,12 @@ def build_cygnss_image(layer_name, selected_days, thr_min, thr_max, aggregation,
     )
 
 
-def reduce_temporal_collection(collection, aggregation):
+def reduce_temporal_collection(collection, aggregation, band_name):
+    """Keep a masked band when the selected period contains no images."""
     if aggregation not in TEMPORAL_AGGREGATIONS:
         raise ValueError(f"Unsupported external-layer metric: {aggregation}")
+    empty_band = ee.Image.constant(0).rename(band_name).selfMask()
+    collection = collection.merge(ee.ImageCollection([empty_band]))
     return getattr(collection, aggregation)()
 
 
@@ -546,15 +549,18 @@ def build_external_layer_image(layer_name, start_date, end_date, mode="shading",
             .filterDate(start_str, end_exclusive)
             .select("precipitation")
         )
-        img = reduce_temporal_collection(collection, aggregation)
+        img = reduce_temporal_collection(collection, aggregation, "precipitation")
 
     elif layer_name == "ndvi":
+        # MOD13Q1 images represent 16-day composites. Include the composite
+        # that started before the selected first day but still overlaps it.
+        ndvi_start = (start_date - dt.timedelta(days=15)).strftime("%Y-%m-%d")
         collection = (
             ee.ImageCollection(NDVI_COLLECTION)
-            .filterDate(start_str, end_exclusive)
+            .filterDate(ndvi_start, end_exclusive)
             .select("NDVI")
         )
-        img = reduce_temporal_collection(collection, aggregation).multiply(0.0001)
+        img = reduce_temporal_collection(collection, aggregation, "NDVI").multiply(0.0001)
 
     elif layer_name == "population_density":
         img = (
@@ -1873,7 +1879,7 @@ if split_view and right_start_date is not None:
 # Drawing a rectangle does NOT change this signature, so no new EE map request
 # is made on the drawing-triggered rerun.
 map_signature = (
-    "external-temporal-metrics-v1",
+    "ndvi-composite-coverage-v1",
     bool(split_view),
     left_shading_layer,
     left_auxiliary_layer,
