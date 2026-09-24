@@ -83,10 +83,10 @@ ELEVATION_IMAGE = "USGS/SRTMGL1_003"
 
 LAYER_OPTIONS = {
     "none": "None",
-    "cygnss_1": f"CYGNSS â€“ {BAND_OPTIONS[1]}",
-    "cygnss_2": f"CYGNSS â€“ {BAND_OPTIONS[2]}",
-    "cygnss_4": f"CYGNSS â€“ {BAND_OPTIONS[4]}",
-    "cygnss_5": f"CYGNSS â€“ {BAND_OPTIONS[5]}",
+    "cygnss_1": f"CYGNSS - {BAND_OPTIONS[1]}",
+    "cygnss_2": f"CYGNSS - {BAND_OPTIONS[2]}",
+    "cygnss_4": f"CYGNSS - {BAND_OPTIONS[4]}",
+    "cygnss_5": f"CYGNSS - {BAND_OPTIONS[5]}",
     "chirps": "Precipitation (CHIRPS)",
     "ndvi": "Vegetation (NDVI)",
     "population_density": "Population density",
@@ -113,7 +113,7 @@ OVERLAY_LEGENDS = {
         "palette": ["#ffffcc", "#ffeda0", "#feb24c", "#f03b20", "#bd0026"],
         "min": 0,
         "max": 1000,
-        "unit": "people/kmÂ²",
+        "unit": "people/km^2",
     },
     "elevation": {
         "title": "Elevation",
@@ -124,11 +124,11 @@ OVERLAY_LEGENDS = {
     },
 }
 AUXILIARY_LAYER_OPTIONS = tuple(OVERLAY_LEGENDS)
-AUXILIARY_SCALE_STEPS = {
-    "chirps": 0.5,
-    "ndvi": 0.01,
-    "population_density": 50.0,
-    "elevation": 100.0,
+AUXILIARY_SCALE_AXES = {
+    "chirps": (0.0, 200.0, 0.5),
+    "ndvi": (-1.0, 1.0, 0.01),
+    "population_density": (0.0, 20000.0, 50.0),
+    "elevation": (-500.0, 9000.0, 100.0),
 }
 
 def band_kind(band_number: int) -> str:
@@ -282,7 +282,7 @@ def get_collection(kind: str):
 
 
 # ---------------------------------------------
-# HELPER FUNCTIONS â€“ CYGNSS BANDS
+# HELPER FUNCTIONS – CYGNSS BANDS
 # ---------------------------------------------
 def cygnss_valid_raw_band(img, band_index):
     """Return a CYGNSS band masked where the dataset uses 255 as no-data."""
@@ -444,7 +444,7 @@ def cygnss_unit(kind: str) -> str:
 def cygnss_legend(layer_name, thr_min, thr_max, aggregation="mean"):
     kind = cygnss_layer_kind(layer_name)
     return {
-        "title": f"CYGNSS â€“ {cygnss_layer_label(layer_name)} ({AGGREGATIONS[aggregation]})",
+        "title": f"CYGNSS - {cygnss_layer_label(layer_name)} ({AGGREGATIONS[aggregation]})",
         "palette": PALETTE_COUNT if aggregation == "count" else (PALETTE_ANOM if kind == "anomaly" else PALETTE_INUND),
         "min": thr_min,
         "max": thr_max,
@@ -1097,26 +1097,24 @@ def remember_map_view(map_state):
 
 
 def auxiliary_scale_controls(side, layer_name):
-    """Choose independent contour levels for an enabled auxiliary layer."""
+    """Choose independent contour levels with a range slider."""
     if layer_name == "none":
         return None
 
     legend = OVERLAY_LEGENDS[layer_name]
-    step = AUXILIARY_SCALE_STEPS[layer_name]
-    number_format = "%.2f" if layer_name == "ndvi" else "%.1f"
+    axis_min, axis_max, step = AUXILIARY_SCALE_AXES[layer_name]
+    number_format = "%.2f" if layer_name == "ndvi" else ("%.1f" if layer_name == "chirps" else "%.0f")
     unit = legend["unit"]
-    st.markdown(f"**Contour scale**{f' ({unit})' if unit != '-' else ''}")
-    min_col, max_col = st.columns(2)
-    with min_col:
-        minimum = st.number_input(
-            "Minimum", value=float(legend["min"]), step=step,
-            format=number_format, key=f"{side}_auxiliary_min_{layer_name}",
-        )
-    with max_col:
-        maximum = st.number_input(
-            "Maximum", value=float(legend["max"]), step=step,
-            format=number_format, key=f"{side}_auxiliary_max_{layer_name}",
-        )
+    label = f"Contour scale ({unit}):" if unit != "-" else "Contour scale:"
+    minimum, maximum = st.slider(
+        label,
+        min_value=axis_min,
+        max_value=axis_max,
+        value=(float(legend["min"]), float(legend["max"])),
+        step=step,
+        format=number_format,
+        key=f"{side}_auxiliary_range_{layer_name}",
+    )
     if minimum >= maximum:
         st.error("Contour scale minimum must be smaller than maximum.")
         st.stop()
@@ -1150,7 +1148,7 @@ def auxiliary_metric_control(side, auxiliary_layer, disabled=False):
     )
 
 
-# ALTAIR PLOT â€“ MIN / MAX / MEAN
+# ALTAIR PLOT – MIN / MAX / MEAN
 # ---------------------------------------------
 def plot_timeseries(df, title, kind, thr_max):
     if df.empty:
@@ -1203,7 +1201,7 @@ def plot_timeseries(df, title, kind, thr_max):
 
 
 # ---------------------------------------------
-# ALTAIR PLOT â€“ PIXEL COUNTS PER DAY
+# ALTAIR PLOT – PIXEL COUNTS PER DAY
 # ---------------------------------------------
 def plot_pixelcount_timeseries(df, title):
     required_cols = {"count_total", "count_inrange"}
@@ -1297,7 +1295,7 @@ def build_png_report(view_info, stats_info):
     left_margin = 60
     line_h = 42
 
-    draw.text((left_margin, y), "CYGNSS Viewer â€” Snapshot report", fill="black", font=font_title)
+    draw.text((left_margin, y), "CYGNSS Viewer - Snapshot report", fill="black", font=font_title)
     y += line_h * 2
 
     header_lines = [
@@ -1327,7 +1325,7 @@ def build_png_report(view_info, stats_info):
     rows = [
         ("Statistics source", stats_info["source"]),
         ("Analysis date range", stats_info["date_range"]),
-        ("Threshold range", f"{stats_info['thr_min']} â†’ {stats_info['thr_max']} {stats_info['unit']}"),
+        ("Threshold range", f"{stats_info['thr_min']} to {stats_info['thr_max']} {stats_info['unit']}"),
         ("Region drawn", stats_info["region_drawn"]),
         ("Rectangle west longitude", stats_info["west_lon"]),
         ("Rectangle east longitude", stats_info["east_lon"]),
@@ -1669,7 +1667,7 @@ with left_col:
         key="left_temporal_mode",
     )
     left_date_range = st.date_input(
-        "Date range (fromâ€“to):",
+        "Date range (from-to):",
         value=(MIN_DATE, MIN_DATE),
         min_value=MIN_DATE,
         max_value=MAX_DATE,
@@ -1725,7 +1723,7 @@ with right_col:
         key="right_temporal_mode", disabled=not split_view,
     )
     right_date_range = st.date_input(
-        "Date range (fromâ€“to):",
+        "Date range (from-to):",
         value=(MIN_DATE, MIN_DATE),
         min_value=MIN_DATE,
         max_value=MAX_DATE,
@@ -1794,7 +1792,7 @@ if left_cygnss_layer is not None and left_thr_min >= left_thr_max:
 left_label = (
     f"MAIN | shading: {LAYER_OPTIONS[left_shading_layer]} | "
     f"auxiliary: {LAYER_OPTIONS[left_auxiliary_layer]} | "
-    f"{left_start_date.strftime('%Y-%m-%d')}â†’{left_end_date.strftime('%Y-%m-%d')} | "
+    f"{left_start_date.strftime('%Y-%m-%d')} to {left_end_date.strftime('%Y-%m-%d')} | "
     f"{AGGREGATIONS[left_aggregation] if is_temporal_layer(left_shading_layer) else 'N/A'}"
 )
 
@@ -1847,7 +1845,7 @@ if split_view:
     right_label = (
         f"SECONDARY | shading: {LAYER_OPTIONS[right_shading_layer]} | "
         f"auxiliary: {LAYER_OPTIONS[right_auxiliary_layer]} | "
-        f"{right_start_date.strftime('%Y-%m-%d')}â†’{right_end_date.strftime('%Y-%m-%d')} | "
+        f"{right_start_date.strftime('%Y-%m-%d')} to {right_end_date.strftime('%Y-%m-%d')} | "
         f"{AGGREGATIONS[right_aggregation] if is_temporal_layer(right_shading_layer) else 'N/A'}"
     )
 else:
@@ -2219,10 +2217,10 @@ stats_info = {
     "thr_max": left_thr_max if left_thr_max is not None else "N/A",
     "unit": "N/A" if left_cygnss_layer is None else ("days" if left_aggregation == "count" else "%"),
     "region_drawn": region_drawn,
-    "west_lon": f"{xmin_report:.6f}Â°" if xmin_report is not None else "N/A",
-    "east_lon": f"{xmax_report:.6f}Â°" if xmax_report is not None else "N/A",
-    "south_lat": f"{ymin_report:.6f}Â°" if ymin_report is not None else "N/A",
-    "north_lat": f"{ymax_report:.6f}Â°" if ymax_report is not None else "N/A",
+    "west_lon": f"{xmin_report:.6f} deg" if xmin_report is not None else "N/A",
+    "east_lon": f"{xmax_report:.6f} deg" if xmax_report is not None else "N/A",
+    "south_lat": f"{ymin_report:.6f} deg" if ymin_report is not None else "N/A",
+    "north_lat": f"{ymax_report:.6f} deg" if ymax_report is not None else "N/A",
     "min": f"{user_min:.4f}" if user_min is not None else "N/A",
     "max": f"{user_max:.4f}" if user_max is not None else "N/A",
     "mean": f"{user_mean:.4f}" if user_mean is not None else "N/A",
