@@ -106,7 +106,7 @@ OVERLAY_LEGENDS = {
         "palette": ["#f7fcf5", "#a1d99b", "#31a354", "#006d2c"],
         "min": 0.0,
         "max": 0.8,
-        "unit": "-",
+        "unit": "",
     },
     "population_density": {
         "title": "Population density",
@@ -1111,7 +1111,7 @@ def auxiliary_scale_controls(side, layer_name):
     axis_min, axis_max, step = AUXILIARY_SCALE_AXES[layer_name]
     number_format = "%.2f" if layer_name == "ndvi" else ("%.1f" if layer_name == "chirps" else "%.0f")
     unit = legend["unit"]
-    label = f"Contour scale ({unit}):" if unit != "-" else "Contour scale:"
+    label = f"Contour scale ({unit}):" if unit else "Contour scale:"
     minimum, maximum = st.slider(
         label,
         min_value=axis_min,
@@ -2191,8 +2191,7 @@ view_info = {
         if left_auxiliary_layer in TEMPORAL_EXTERNAL_LAYERS else "N/A"
     ),
     "left_auxiliary_scale": (
-        f"{left_auxiliary_range[0]:g} to {left_auxiliary_range[1]:g} "
-        f"{OVERLAY_LEGENDS[left_auxiliary_layer]['unit']}"
+        f"{left_auxiliary_range[0]:g} to {left_auxiliary_range[1]:g} {OVERLAY_LEGENDS[left_auxiliary_layer]['unit']}".strip()
         if left_auxiliary_range is not None else "N/A"
     ),
     "right_shading": LAYER_OPTIONS[right_shading_layer] if split_view else "None",
@@ -2202,8 +2201,7 @@ view_info = {
         if split_view and right_auxiliary_layer in TEMPORAL_EXTERNAL_LAYERS else "N/A"
     ),
     "right_auxiliary_scale": (
-        f"{right_auxiliary_range[0]:g} to {right_auxiliary_range[1]:g} "
-        f"{OVERLAY_LEGENDS[right_auxiliary_layer]['unit']}"
+        f"{right_auxiliary_range[0]:g} to {right_auxiliary_range[1]:g} {OVERLAY_LEGENDS[right_auxiliary_layer]['unit']}".strip()
         if right_auxiliary_range is not None else "N/A"
     ),
 }
