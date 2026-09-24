@@ -1653,6 +1653,7 @@ with left_col:
         format_func=lambda k: LAYER_OPTIONS[k],
         key="left_shading_layer",
     )
+    left_aggregation = displayed_metric_control("left", left_shading_layer)
 
     left_auxiliary_enabled = st.checkbox(
         "Enable Auxiliary layer", key="left_auxiliary_enabled"
@@ -1690,8 +1691,6 @@ with left_col:
         min_value=MIN_DATE, max_value=MAX_DATE,
         key="left_window_end", disabled=left_temporal_mode != "Rolling window",
     )
-    left_aggregation = displayed_metric_control("left", left_shading_layer)
-
 with right_col:
     st.markdown("### SECONDARY panel")
 
@@ -1702,6 +1701,9 @@ with right_col:
         format_func=lambda k: LAYER_OPTIONS[k],
         key="right_shading_layer",
         disabled=not split_view,
+    )
+    right_aggregation = displayed_metric_control(
+        "right", right_shading_layer, disabled=not split_view
     )
 
     right_auxiliary_enabled = st.checkbox(
@@ -1746,10 +1748,6 @@ with right_col:
         min_value=MIN_DATE, max_value=MAX_DATE,
         key="right_window_end", disabled=not split_view or right_temporal_mode != "Rolling window",
     )
-    right_aggregation = displayed_metric_control(
-        "right", right_shading_layer, disabled=not split_view
-    )
-
 left_start_date, left_end_date, left_selected_dates, left_sel_days = resolve_panel_period(
     left_temporal_mode, left_date_range, left_window_end, left_window_days
 )
