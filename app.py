@@ -282,7 +282,7 @@ def get_collection(kind: str):
 
 
 # ---------------------------------------------
-# HELPER FUNCTIONS – CYGNSS BANDS
+# HELPER FUNCTIONS â€“ CYGNSS BANDS
 # ---------------------------------------------
 def cygnss_valid_raw_band(img, band_index):
     """Return a CYGNSS band masked where the dataset uses 255 as no-data."""
@@ -1154,14 +1154,59 @@ def auxiliary_metric_control(side, auxiliary_layer, disabled=False):
     )
 
 
-# ALTAIR PLOT – MIN / MAX / MEAN
+# ALTAIR PLOT â€“ MIN / MAX / MEAN
 # ---------------------------------------------
+def scientific_chart_style(chart):
+    """Use a consistent, publication-style appearance independent of the UI theme."""
+    return (
+        chart.configure(background="white", font="sans-serif")
+        .configure_view(stroke=None)
+        .configure_axis(
+            domain=True,
+            domainColor="#222222",
+            domainWidth=1,
+            ticks=True,
+            tickColor="#222222",
+            tickSize=5,
+            labelColor="#222222",
+            labelFontSize=12,
+            labelPadding=6,
+            titleColor="#222222",
+            titleFontSize=14,
+            titleFontWeight="normal",
+            titlePadding=14,
+        )
+        .configure_axisX(grid=False)
+        .configure_axisY(grid=True, gridColor="#e5e5e5", gridWidth=0.5, gridDash=[2, 3])
+        .configure_legend(
+            orient="bottom",
+            direction="horizontal",
+            title=None,
+            labelColor="#222222",
+            labelFontSize=12,
+            symbolStrokeWidth=2,
+            padding=10,
+        )
+        .configure_title(
+            anchor="start", fontSize=14, fontWeight="normal",
+            color="#222222", offset=18,
+        )
+    )
+
+
+def date_axis():
+    return alt.Axis(
+        title="Date", format="%d %b %Y", labelAngle=-35,
+        labelOverlap=True, tickCount=6,
+    )
+
+
 def plot_timeseries(df, title, kind, thr_max):
     if df.empty:
         return
 
     df_plot = df.reset_index()
-    df_plot["date_str"] = df_plot["date"]
+    df_plot["date"] = pd.to_datetime(df_plot["date"])
 
     if kind == "anomaly":
         ymin = float(df_plot[["min", "mean", "max"]].min().min())
@@ -1169,45 +1214,53 @@ def plot_timeseries(df, title, kind, thr_max):
         pad = 0.1 * max(1.0, abs(ymin) + abs(ymax))
         y_lower = ymin - pad
         y_upper = ymax + pad
-        y_title = "Anomaly value"
+        y_title = "Fractional inundation anomaly [%]"
     else:
         y_lower = 0.0
         y_upper = thr_max + 5
-        y_title = "Value"
+        y_title = "Fractional inundation [%]"
 
     chart = (
         alt.Chart(df_plot)
-        .transform_fold(
-            ["min", "max", "mean"],
-            as_=["stat", "value"],
+        .transform_fold(["min", "max", "mean"], as_=["stat", "value"])
+        .transform_calculate(
+            statistic="datum.stat == 'min' ? 'Minimum' : datum.stat == 'max' ? 'Maximum' : 'Mean'"
         )
-        .mark_line(point=True)
+        .mark_line(strokeWidth=2, point=alt.OverlayMarkDef(size=30, filled=True))
         .encode(
-            x=alt.X(
-                "date_str:N",
-                title="Date",
-                sort=df_plot["date_str"].tolist(),
-            ),
+            x=alt.X("date:T", title="Date", axis=date_axis()),
             y=alt.Y(
-                "value:Q",
-                title=y_title,
-                scale=alt.Scale(domain=[y_lower, y_upper]),
+                "value:Q", title=y_title,
+                scale=alt.Scale(domain=[y_lower, y_upper], zero=False),
             ),
-            color=alt.Color("stat:N", title="Statistic"),
+            color=alt.Color(
+                "statistic:N", title=None,
+                scale=alt.Scale(
+                    domain=["Minimum", "Maximum", "Mean"],
+                    range=["#666666", "#b06030", "#165a8a"],
+                ),
+            ),
+            strokeDash=alt.StrokeDash(
+                "statistic:N", title=None,
+                scale=alt.Scale(
+                    domain=["Minimum", "Maximum", "Mean"],
+                    range=[[5, 3], [2, 3], [1, 0]],
+                ),
+            ),
             tooltip=[
-                alt.Tooltip("date_str:N", title="Date"),
-                alt.Tooltip("stat:N", title="Statistic"),
-                alt.Tooltip("value:Q", title="Value"),
+                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                alt.Tooltip("statistic:N", title="Statistic"),
+                alt.Tooltip("value:Q", title=y_title, format=".2f"),
             ],
         )
         .properties(title=title, height=400)
         .interactive()
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(scientific_chart_style(chart), use_container_width=True, theme=None)
 
 
 # ---------------------------------------------
-# ALTAIR PLOT – PIXEL COUNTS PER DAY
+# ALTAIR PLOT â€“ PIXEL COUNTS PER DAY
 # ---------------------------------------------
 def plot_pixelcount_timeseries(df, title):
     required_cols = {"count_total", "count_inrange"}
@@ -1215,66 +1268,47 @@ def plot_pixelcount_timeseries(df, title):
         return
 
     df_plot = df.reset_index()
-    df_plot["date_str"] = df_plot["date"]
-
-    df_plot["out_of_range"] = df_plot["count_total"] - df_plot["count_inrange"]
-    df_plot.loc[df_plot["out_of_range"] < 0, "out_of_range"] = 0
+    df_plot["date"] = pd.to_datetime(df_plot["date"])
+    df_plot["out_of_range"] = (
+        df_plot["count_total"] - df_plot["count_inrange"]
+    ).clip(lower=0)
 
     max_count = df_plot["count_total"].max()
     y_upper = max_count * 1.2 if max_count > 0 else 1
 
-    chart_bars = (
+    chart = (
         alt.Chart(df_plot)
-        .transform_fold(
-            ["count_inrange", "out_of_range"],
-            as_=["type", "count"],
+        .transform_fold(["count_inrange", "out_of_range"], as_=["type", "count"])
+        .transform_calculate(
+            pixel_type="datum.type == 'count_inrange' ? 'In-range' : 'Out-of-range'"
         )
         .mark_bar()
         .encode(
-            x=alt.X(
-                "date_str:N",
-                title="Date",
-                sort=df_plot["date_str"].tolist(),
-            ),
+            x=alt.X("yearmonthdate(date):T", title="Date", axis=date_axis()),
             y=alt.Y(
-                "count:Q",
-                title="Pixel count",
-                scale=alt.Scale(domain=[0, y_upper]),
-                stack="zero",
+                "count:Q", title="Number of pixels [â€“]",
+                axis=alt.Axis(format=",.0f", tickMinStep=1),
+                scale=alt.Scale(domain=[0, y_upper]), stack="zero",
             ),
             color=alt.Color(
-                "type:N",
-                title="Pixel type",
-                sort=["count_inrange", "out_of_range"],
-                legend=alt.Legend(
-                    labelExpr="datum.value == 'count_inrange' ? 'In-range' : 'Out-of-range'"
+                "pixel_type:N", title=None,
+                scale=alt.Scale(
+                    domain=["In-range", "Out-of-range"],
+                    range=["#39759b", "#d5d5d5"],
                 ),
             ),
+            order=alt.Order("type:N", sort="ascending"),
             tooltip=[
-                alt.Tooltip("date_str:N", title="Date"),
-                alt.Tooltip("count_total:Q", title="Total pixels"),
-                alt.Tooltip("count_inrange:Q", title="In-range pixels"),
-                alt.Tooltip("out_of_range:Q", title="Out-of-range pixels"),
+                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                alt.Tooltip("count_total:Q", title="Total pixels", format=",.0f"),
+                alt.Tooltip("count_inrange:Q", title="In-range pixels", format=",.0f"),
+                alt.Tooltip("out_of_range:Q", title="Out-of-range pixels", format=",.0f"),
             ],
         )
+        .properties(title=title, height=400)
+        .interactive()
     )
-
-    chart_text = (
-        alt.Chart(df_plot)
-        .mark_text(dy=-6)
-        .encode(
-            x=alt.X("date_str:N", sort=df_plot["date_str"].tolist()),
-            y=alt.Y("count_total:Q", scale=alt.Scale(domain=[0, y_upper])),
-            text=alt.Text("count_total:Q", format="d"),
-        )
-    )
-
-    chart = (chart_bars + chart_text).properties(
-        title=title,
-        height=400,
-    ).interactive()
-
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(scientific_chart_style(chart), use_container_width=True, theme=None)
 
 
 def build_png_report(view_info, stats_info):
