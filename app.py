@@ -1156,37 +1156,43 @@ def auxiliary_metric_control(side, auxiliary_layer, disabled=False):
 
 # ALTAIR PLOT – MIN / MAX / MEAN
 # ---------------------------------------------
-def scientific_chart_style(chart):
-    """Use publication-style axes and typography with the dashboard theme."""
-    return (
-        chart.configure(background="transparent", font="sans-serif")
+def scientific_chart_style(chart, publication=False):
+    """Keep axes distinct on screen and use black axes for exported figures."""
+    axis_color = "#222222" if publication else "#6b7280"
+    chart = (
+        chart.configure(
+            background="white" if publication else "transparent",
+            font="sans-serif",
+        )
         .configure_view(stroke=None)
         .configure_axis(
             domain=True,
-            domainWidth=1,
+            domainColor=axis_color,
+            domainWidth=2,
             ticks=True,
-            tickSize=5,
-            labelFontSize=12,
-            labelPadding=6,
-            titleFontSize=14,
+            tickColor=axis_color,
+            tickWidth=2,
+            tickSize=7,
+            labelFontSize=13,
+            labelPadding=7,
+            titleFontSize=15,
             titleFontWeight="normal",
-            titlePadding=14,
+            titlePadding=16,
+            **({"labelColor": "#222222", "titleColor": "#222222"} if publication else {}),
         )
         .configure_axisX(grid=False)
         .configure_axisY(grid=True, gridOpacity=0.15, gridWidth=0.5, gridDash=[2, 3])
         .configure_legend(
-            orient="bottom",
-            direction="horizontal",
-            title=None,
-            labelFontSize=12,
-            symbolStrokeWidth=2,
-            padding=10,
+            orient="bottom", direction="horizontal", title=None,
+            labelFontSize=13, symbolStrokeWidth=2, padding=10,
+            **({"labelColor": "#222222"} if publication else {}),
         )
         .configure_title(
-            anchor="start", fontSize=14, fontWeight="normal",
-            offset=18,
+            anchor="start", fontSize=15, fontWeight="normal", offset=18,
+            **({"color": "#222222"} if publication else {}),
         )
     )
+    return chart
 
 
 def date_axis():
@@ -1196,51 +1202,55 @@ def date_axis():
     )
 
 
-def plot_timeseries(df, title, kind, thr_max):
-    if df.empty:
-        return
+def timeseries_y_limits(df, statistics, kind, thr_max, full_range=False):
+    """Set limits from the visible series, rather than hidden min/max curves."""
+    values = df[list(statistics)].apply(pd.to_numeric, errors="coerce")
+    ymin = float(values.min().min())
+    ymax = float(values.max().max())
+    if pd.isna(ymin) or pd.isna(ymax):
+        return None
+    if full_range:
+        return (-100.0, 100.0) if kind == "anomaly" else (0.0, float(thr_max) + 5.0)
+    if kind == "anomaly":
+        padding = 0.1 * max(1.0, ymax - ymin)
+        return ymin - padding, ymax + padding
+    return 0.0, max(1.0, ymax * 1.1)
 
+
+def build_statistics_chart(df, title, kind, statistics, y_limits):
+    """Build only selected curves; keep the time axis as a true date scale."""
+    labels = {"mean": "Mean", "min": "Minimum", "max": "Maximum"}
+    y_title = (
+        "Fractional inundation anomaly [%]"
+        if kind == "anomaly" else "Fractional inundation [%]"
+    )
     df_plot = df.reset_index()
     df_plot["date"] = pd.to_datetime(df_plot["date"])
-
-    if kind == "anomaly":
-        ymin = float(df_plot[["min", "mean", "max"]].min().min())
-        ymax = float(df_plot[["min", "mean", "max"]].max().max())
-        pad = 0.1 * max(1.0, abs(ymin) + abs(ymax))
-        y_lower = ymin - pad
-        y_upper = ymax + pad
-        y_title = "Fractional inundation anomaly [%]"
-    else:
-        y_lower = 0.0
-        y_upper = thr_max + 5
-        y_title = "Fractional inundation [%]"
-
-    chart = (
+    # A short table excludes hidden series from both drawing and automatic limits.
+    df_plot = df_plot[["date", *statistics]].melt(
+        id_vars="date", value_vars=list(statistics),
+        var_name="stat", value_name="value",
+    )
+    df_plot["statistic"] = df_plot["stat"].map(labels)
+    selected_labels = [labels[key] for key in statistics]
+    colors = {"Mean": "#246fa3", "Minimum": "#737373", "Maximum": "#b06030"}
+    dashes = {"Mean": [1, 0], "Minimum": [5, 3], "Maximum": [2, 3]}
+    return (
         alt.Chart(df_plot)
-        .transform_fold(["min", "max", "mean"], as_=["stat", "value"])
-        .transform_calculate(
-            statistic="datum.stat == 'min' ? 'Minimum' : datum.stat == 'max' ? 'Maximum' : 'Mean'"
-        )
-        .mark_line(strokeWidth=2, point=alt.OverlayMarkDef(size=30, filled=True))
+        .mark_line(clip=True, strokeWidth=2, point=alt.OverlayMarkDef(size=24, filled=True))
         .encode(
             x=alt.X("date:T", title="Date", axis=date_axis()),
             y=alt.Y(
                 "value:Q", title=y_title,
-                scale=alt.Scale(domain=[y_lower, y_upper], zero=False),
+                scale=alt.Scale(domain=list(y_limits), zero=False),
             ),
             color=alt.Color(
                 "statistic:N", title=None,
-                scale=alt.Scale(
-                    domain=["Minimum", "Maximum", "Mean"],
-                    range=["#666666", "#b06030", "#165a8a"],
-                ),
+                scale=alt.Scale(domain=selected_labels, range=[colors[x] for x in selected_labels]),
             ),
             strokeDash=alt.StrokeDash(
                 "statistic:N", title=None,
-                scale=alt.Scale(
-                    domain=["Minimum", "Maximum", "Mean"],
-                    range=[[5, 3], [2, 3], [1, 0]],
-                ),
+                scale=alt.Scale(domain=selected_labels, range=[dashes[x] for x in selected_labels]),
             ),
             tooltip=[
                 alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
@@ -1249,9 +1259,112 @@ def plot_timeseries(df, title, kind, thr_max):
             ],
         )
         .properties(title=title, height=400)
-        .interactive()
     )
-    st.altair_chart(scientific_chart_style(chart), use_container_width=True, theme="streamlit")
+
+
+@st.cache_data(show_spinner=False)
+def export_chart_image(spec_json, image_format):
+    """Render a standalone figure; optional dependency: vl-convert-python."""
+    import vl_convert as vlc
+
+    if image_format == "svg":
+        return vlc.vegalite_to_svg(spec_json).encode("utf-8")
+    if image_format == "png":
+        return vlc.vegalite_to_png(spec_json, scale=3)
+    raise ValueError(f"Unsupported figure format: {image_format}")
+
+
+def chart_downloads(chart, filename, key):
+    """Export exactly the chosen series and numeric limits, independent of mouse zoom."""
+    try:
+        import vl_convert  # noqa: F401 - check optional export dependency
+    except ImportError:
+        st.caption("To download the figure, open the chart menu and choose Save as PNG or SVG.")
+        return
+
+    publication_chart = scientific_chart_style(chart, publication=True).properties(
+        width=1000, height=450,
+    )
+    spec_json = publication_chart.to_json()
+    try:
+        svg = export_chart_image(spec_json, "svg")
+        png = export_chart_image(spec_json, "png")
+    except Exception:
+        st.caption("Figure download is temporarily unavailable; use the chart menu to save the figure.")
+        return
+
+    col_svg, col_png = st.columns(2)
+    with col_svg:
+        st.download_button(
+            "Download figure SVG", data=svg, mime="image/svg+xml",
+            file_name=f"{filename}.svg", key=f"{key}_svg",
+        )
+    with col_png:
+        st.download_button(
+            "Download figure PNG", data=png, mime="image/png",
+            file_name=f"{filename}.png", key=f"{key}_png",
+        )
+    st.caption("Downloads use the selected curves and Y-axis limits, with a white background and black axes.")
+
+
+def plot_timeseries(df, title, kind, thr_max):
+    if df.empty:
+        return
+
+    labels = {"mean": "Mean", "min": "Minimum", "max": "Maximum"}
+    statistics = st.multiselect(
+        "Statistics to show:", list(labels), default=["mean"],
+        format_func=labels.get, key="cygnss_statistics_to_show",
+    )
+    if not statistics:
+        st.info("Select at least one statistic to draw the figure.")
+        return
+
+    with st.expander("Figure settings"):
+        axis_mode = st.selectbox(
+            "Y-axis range:", ["Fit selected curves", "Full product range", "Set manually"],
+            key="cygnss_y_axis_mode",
+        )
+        y_limits = timeseries_y_limits(
+            df, statistics, kind, thr_max,
+            full_range=axis_mode == "Full product range",
+        )
+        if y_limits is None:
+            st.info("No numeric values are available for the selected curves.")
+            return
+        if axis_mode == "Set manually":
+            col_min, col_max = st.columns(2)
+            with col_min:
+                y_min = st.number_input(
+                    "Y minimum:", value=float(y_limits[0]),
+                    key="cygnss_chart_y_min", format="%.3f",
+                )
+            with col_max:
+                y_max = st.number_input(
+                    "Y maximum:", value=float(y_limits[1]),
+                    key="cygnss_chart_y_max", format="%.3f",
+                )
+            if y_min >= y_max:
+                st.info("Y minimum must be smaller than Y maximum.")
+                return
+            y_limits = (y_min, y_max)
+        zoom_axes = st.checkbox(
+            "Enable mouse zoom and pan", value=False,
+            key="cygnss_chart_zoom_axes",
+        )
+        show_title = st.checkbox("Show figure title", value=True, key="cygnss_chart_title")
+
+    figure_title = title if show_title else ""
+    chart = build_statistics_chart(df, figure_title, kind, statistics, y_limits)
+    screen_chart = chart.interactive() if zoom_axes else chart
+    st.altair_chart(
+        scientific_chart_style(screen_chart), use_container_width=True, theme="streamlit",
+    )
+    dates = pd.to_datetime(df.index)
+    period = f"{dates.min():%Y%m%d}_{dates.max():%Y%m%d}"
+    chart_downloads(
+        chart, f"cygnss_{'_'.join(statistics)}_{period}", key="cygnss_statistics_figure",
+    )
 
 
 # ---------------------------------------------
@@ -1304,6 +1417,9 @@ def plot_pixelcount_timeseries(df, title):
         .interactive()
     )
     st.altair_chart(scientific_chart_style(chart), use_container_width=True, theme="streamlit")
+    dates = pd.to_datetime(df.index)
+    period = f"{dates.min():%Y%m%d}_{dates.max():%Y%m%d}"
+    chart_downloads(chart, f"cygnss_pixel_counts_{period}", key="cygnss_counts_figure")
 
 
 def build_png_report(view_info, stats_info):
@@ -2163,9 +2279,9 @@ else:
 
                         with col_ts:
                             title_ts = (
-                                f"Daily min / max / mean anomaly (MAIN area, {cygnss_layer_label(left_cygnss_layer)})"
+                                f"Daily inundation anomaly ({cygnss_layer_label(left_cygnss_layer)})"
                                 if stats_kind == "anomaly"
-                                else f"Daily min / max / mean (MAIN area, {cygnss_layer_label(left_cygnss_layer)})"
+                                else f"Daily fractional inundation ({cygnss_layer_label(left_cygnss_layer)})"
                             )
                             plot_timeseries(df_r, title_ts, stats_kind, left_thr_max)
 
